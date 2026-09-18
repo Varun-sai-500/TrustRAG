@@ -235,8 +235,37 @@ async def retrieval_node(state: AgentState) -> AgentState:
         if state.get("embedding_model"):
             retrieve_kwargs["embedding_model"] = state.get("embedding_model")
 
+        # Deterministic query router: SIMPLE reuses today's single hybrid call
+        # verbatim; TEMPORAL adds an explicit reference_time; COMPARISON and
+        # COMPLEX fan out to bounded parallel retrievals merged by RRF score.
+        # Everything downstream (rerank → integrity → persist) is untouched.
+        from app.agent.router import fanout_retrieve, route_query
+
+        routed = (
+            route_query(state["current_query"], max_sub_queries=cfg.max_fanout_sub_queries)
+            if cfg.router_enabled
+            else None
+        )
+        if routed is not None and routed.reference_time is not None:
+            retrieve_kwargs["reference_time"] = routed.reference_time
+        if routed is not None and len(routed.sub_queries) > 1:
+            await add_trace_event(
+                state["analysis_id"],
+                "retrieval.routed",
+                {
+                    "message": f"Query routed as {routed.route.value}: "
+                    f"{len(routed.sub_queries)} parallel retrievals",
+                    "route": routed.route.value,
+                    "sub_queries": routed.sub_queries,
+                },
+            )
+
         try:
-            candidates = await retrieve_hybrid_chunks(**retrieve_kwargs)
+            if routed is None or len(routed.sub_queries) == 1:
+                candidates = await retrieve_hybrid_chunks(**retrieve_kwargs)
+            else:
+                branch_kwargs = {k: v for k, v in retrieve_kwargs.items() if k != "query"}
+                candidates = await fanout_retrieve(routed.sub_queries, branch_kwargs)
         except RetrievalOutageError as exc:
             # Infra outage (Qdrant / embedding service unreachable) — NOT
             # "no evidence". Surface it distinctly, store a clear message,
@@ -729,6 +758,7 @@ async def verification_node(state: AgentState) -> AgentState:
             provider=state.get("llm_provider"),
             model=state.get("llm_model"),
             attempt=state.get("attempts", 0),
+            kb_id_str=state.get("kb_id"),
         )
 
     try:

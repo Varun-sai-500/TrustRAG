@@ -119,7 +119,7 @@ def test_delete_document_success(mock_create_indexes, mock_connect):
     mock_coll.delete_one = AsyncMock()
 
     mock_qdrant = MagicMock()
-    mock_qdrant.collection_exists.return_value = False
+    mock_qdrant.collection_exists = AsyncMock(return_value=False)
 
     with (
         patch("app.services.kb_service.get_collection", return_value=mock_coll),

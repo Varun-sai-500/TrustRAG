@@ -138,48 +138,32 @@ async def delete_kb(kb_id_str: str, user_id_str: str) -> None:
     """
     # Ensure KB exists and belongs to the user
     kb = await get_kb(kb_id_str, user_id_str)
-
-    # If KB is a snapshot, just delete it permanently
-    if kb.is_snapshot:
-        kb_id = ObjectId(kb_id_str)
-        # 1. Delete associated documents in MongoDB
-        await get_collection(Collections.DOCUMENTS).delete_many({"knowledge_base_id": kb_id})
-
-        # 2. Delete associated document chunks in MongoDB
-        await get_collection(Collections.DOCUMENT_CHUNKS).delete_many({"knowledge_base_id": kb_id})
-
-        # 3. Drop the associated Qdrant vector collection to avoid orphaned storage
-        await delete_kb_collection(kb_id_str)
-
-        # 4. Delete the KB record itself
-        await get_collection(Collections.KNOWLEDGE_BASES).delete_one({"_id": kb_id})
-
-        # Cached answers must never outlive the evidence that produced them.
-        from app.core.semantic_cache import invalidate_semantic_cache
-
-        invalidate_semantic_cache(kb_id_str)
-        logger.info("Snapshot KB permanently deleted", kb_id=kb_id_str)
-        return
-
-    # For original KB, delete all associated data (documents, chunks, vectors)
-    # together with the KB record so no orphaned rows are left behind.
     kb_id = ObjectId(kb_id_str)
+
+    # Vectors FIRST: a failed drop must leave all metadata intact for retry.
+    # Mongo-first ordering would delete records and then fail on vectors,
+    # leaving a live KB whose collection still serves "deleted" evidence.
+    # (Snapshots follow the same path via their own ids.)
+    await delete_kb_collection(kb_id_str)
+
     # 1. Delete associated documents in MongoDB
     await get_collection(Collections.DOCUMENTS).delete_many({"knowledge_base_id": kb_id})
 
     # 2. Delete associated document chunks in MongoDB
     await get_collection(Collections.DOCUMENT_CHUNKS).delete_many({"knowledge_base_id": kb_id})
 
-    # 3. Drop the associated Qdrant vector collection
-    await delete_kb_collection(kb_id_str)
-
-    # 4. Delete the KB record itself
+    # 3. Delete the KB record itself
     await get_collection(Collections.KNOWLEDGE_BASES).delete_one({"_id": kb_id})
 
+    # Cached answers must never outlive the evidence that produced them.
     from app.core.semantic_cache import invalidate_semantic_cache
 
     invalidate_semantic_cache(kb_id_str)
-    logger.info("Original KB deleted with all associated data", kb_id=kb_id_str)
+    logger.info(
+        "KB permanently deleted with all associated data",
+        kb_id=kb_id_str,
+        was_snapshot=kb.is_snapshot,
+    )
 
 
 async def add_document(
@@ -335,6 +319,8 @@ async def create_kb_snapshot(kb_id_str: str, user_id_str: str, version: str = "1
             "character_offset": chunk["character_offset"],
             "zone": chunk.get("zone", "body"),
             "text_hash": chunk.get("text_hash"),
+            "ocr_used": bool(chunk.get("ocr_used", False)),
+            "ocr_confidence": chunk.get("ocr_confidence"),
             "is_snapshot": True,
         }
         await chunks_coll.insert_one(chunk_copy)
@@ -449,6 +435,33 @@ async def rollback_kb_to_snapshot(
     kb_id = ObjectId(kb_id_str)
     snapshot_kb_id = ObjectId(snapshot_kb_id_str)
 
+    # 0. Refuse snapshots with no searchable vectors (taken before the
+    # vector-copy fix): restoring those silently yields an empty KB while the
+    # Mongo copies pretend everything is fine. Re-upload instead.
+    snap_client = await get_qdrant_client()
+    snap_points = 0
+    try:
+        snap_count = await snap_client.count(get_collection_name(snapshot_kb_id_str), exact=True)
+        snap_points = snap_count.count
+    except Exception as exc:
+        logger.warning(
+            "Snapshot vector check failed; proceeding without the guard",
+            snapshot_id=snapshot_kb_id_str,
+            error=str(exc),
+        )
+        snap_points = -1
+    if snap_points == 0:
+        snap_chunks = await get_collection(Collections.DOCUMENT_CHUNKS).count_documents(
+            {"knowledge_base_id": snapshot_kb_id}
+        )
+        if snap_chunks > 0:
+            from app.core.exceptions import ConflictError
+
+            raise ConflictError(
+                "Snapshot has no searchable vectors (predates the vector-copy fix); "
+                "re-upload the documents instead of rolling back",
+            )
+
     # 1. Delete current (live) KB data
     await get_collection(Collections.DOCUMENTS).delete_many({"knowledge_base_id": kb_id})
     await get_collection(Collections.DOCUMENT_CHUNKS).delete_many({"knowledge_base_id": kb_id})
@@ -505,11 +518,14 @@ async def delete_document(doc_id_str: str, user_id_str: str) -> None:
     # 1. Delete chunks in MongoDB
     await get_collection(Collections.DOCUMENT_CHUNKS).delete_many({"document_id": doc_id})
 
-    # 2. Delete points from Qdrant collection
+    # 2. Delete points from Qdrant collection. Fail CLOSED on vector-store
+    # errors: swallowing them here would delete the metadata below while the
+    # points keep serving evidence for a "deleted" document. The record below
+    # is only removed after vectors are gone, so a failure stays retry-safe.
     client = await get_qdrant_client()
     collection_name = get_collection_name(kb_id_str)
-    try:
-        if await client.collection_exists(collection_name):
+    if await client.collection_exists(collection_name):
+        try:
             await client.delete(
                 collection_name=collection_name,
                 points_selector=models.FilterSelector(
@@ -523,12 +539,13 @@ async def delete_document(doc_id_str: str, user_id_str: str) -> None:
                     )
                 ),
             )
-    except Exception as exc:
-        logger.warning(
-            "Failed to delete Qdrant points for document",
-            doc_id=doc_id_str,
-            error=str(exc),
-        )
+        except Exception as exc:
+            logger.error(
+                "Qdrant point delete failed; document record kept for retry",
+                doc_id=doc_id_str,
+                error=str(exc),
+            )
+            raise
 
     # 3. Delete document record itself
     await doc_coll.delete_one({"_id": doc_id})

@@ -1,6 +1,6 @@
 # TRUSTRAG — Threat Model
 
-**Version:** 1.0 | **Phase:** 0  
+**Version:** 1.1 | **Phase:** RAG quality 0–8  
 **Reviewer:** Engineering
 
 > This threat model covers MVP scope. It will be updated as features are added.
@@ -21,6 +21,9 @@
 | Analysis results | High | User data |
 | Execution traces | Medium | May contain query/evidence fragments |
 | System configuration | Low | models.yaml — no secrets |
+| OCR models (`~/.onnx`) | Medium | First-use download supply chain (PyPI); verify package pins in `uv.lock` |
+| KB snapshots | High | Full data copies; same ownership checks as live KBs |
+| Router/claim-retrieval budgets | Low | `max_sub_queries: 3`, `max_claim_retrievals: 3` bound fan-out cost |
 
 ---
 
@@ -59,15 +62,15 @@
 | **Mitigation** | Every resource access verifies `user_id` ownership server-side. MongoDB queries always include `user_id` filter. |
 | **Residual Risk** | Low (if authorization is consistently applied) |
 
-### T-04: Denial of Wallet via AI Cost Explosion
+### T-04: Denial of Wallet / Local Exhaustion via AI Cost Explosion
 
 | Field | Value |
 |-------|-------|
-| **Threat** | Attacker sends large/many queries triggering excessive Gemini API calls |
-| **Attack Vector** | High-frequency requests, oversized documents, adversarial queries |
-| **Impact** | Unexpected API costs |
+| **Threat** | Attacker sends large/many queries triggering excessive cloud API calls or local compute exhaustion |
+| **Attack Vector** | High-frequency requests, oversized documents, adversarial queries (multi-`?` fans out ≤3 retrievals; crafted NEUTRAL-heavy answers trigger +3 claim retrievals; scanned PDFs burn OCR compute) |
+| **Impact** | Unexpected API costs; local CPU saturation |
 | **Likelihood** | Medium |
-| **Mitigation** | Rate limiting per IP (SlowAPI). Max input token limit enforced before LLM calls. Max recovery attempts bounded. Max context chunks limited. File size limit on uploads. |
+| **Mitigation** | Per-client rate limits (analyses/auth/upload/url-ingest). Max input token limit enforced before LLM calls. Max recovery attempts bounded. Max context chunks limited. File size limit on uploads. Router fan-out ceiling (`max_sub_queries: 3`), claim-retrieval budget (`max_claim_retrievals: 3`), OCR density gate + fail-open. Gemini costs apply only when a Gemini provider is selected (default stack is local, zero marginal cost). |
 | **Residual Risk** | Low-Medium. Free-tier Gemini has built-in rate limits as an additional safety net. |
 
 ### T-05: Credential / Secret Leakage
@@ -89,7 +92,7 @@
 | **Attack Vector** | ZIP bomb inside PDF, excessively large file, malformed encoding |
 | **Impact** | DoS, memory exhaustion |
 | **Likelihood** | Low-Medium |
-| **Mitigation** | File size limit enforced before parsing. Supported format allowlist. Parser runs in bounded context. MaliciousDocumentError exception type for flagging. |
+| **Mitigation** | File size limit enforced before parsing. Supported format allowlist (8 formats). Magic-bytes validation + per-format decompression-bomb ratios. OCR density gate with fail-open (engine failure keeps native text, never kills ingest). Parser runs in bounded context. MaliciousDocumentError exception type for flagging. |
 | **Residual Risk** | Medium. PyMuPDF parsing cannot guarantee safety against all malformed inputs. |
 
 ### T-07: JWT Token Attacks
@@ -122,8 +125,30 @@
 | **Attack Vector** | User does not update knowledge base after policy changes |
 | **Impact** | Incorrect answers delivered with high confidence |
 | **Likelihood** | High (operational risk) |
-| **Mitigation** | Evidence integrity analysis checks temporal validity (`effective_from`, `effective_until`). Source conflicts flagged. Version tracking per document. |
+| **Mitigation** | Evidence integrity analysis checks temporal validity (`effective_from`, `effective_until`). Source conflicts flagged. Version tracking per document. KB snapshots + rollback routes (rollback returns a NEW live id; vector-less snapshots refused with 409). |
 | **Residual Risk** | Medium. Temporal analysis relies on metadata quality. |
+
+### T-10: Snapshot/Rollback IDOR
+
+| Field | Value |
+|-------|-------|
+| **Threat** | User A restores or reads User B's snapshot via ID enumeration |
+| **Attack Vector** | Modify snapshot ObjectId in rollback/snapshot API requests |
+| **Impact** | Data leakage across tenants; destructive restore of another user's KB |
+| **Likelihood** | Medium |
+| **Mitigation** | Snapshot, rollback, and restore paths all verify `user_id` ownership server-side (same `get_kb` gate as live KBs); rollback additionally rejects snapshots whose `parent_kb_id` does not match. Covered by lifecycle route tests. |
+| **Residual Risk** | Low (if authorization is consistently applied) |
+
+### T-11: OCR Supply-Chain / First-Use Stall
+
+| Field | Value |
+|-------|-------|
+| **Threat** | Compromised OCR package/model, or first scanned upload stalling on a large model download |
+| **Attack Vector** | Malicious `rapidocr-onnxruntime` release or model-host compromise; slow network on first scanned page |
+| **Impact** | Code execution via dependency (high) / availability dip on first scan (low) |
+| **Likelihood** | Low |
+| **Mitigation** | `rapidocr-onnxruntime` pinned in `uv.lock` (`--locked` Docker builds); pip-audit in CI; engine import is lazy so API boots without it; OCR failures fail open to native text. Pre-warm models on deploy (ingest one scanned PDF). |
+| **Residual Risk** | Low |
 
 ---
 

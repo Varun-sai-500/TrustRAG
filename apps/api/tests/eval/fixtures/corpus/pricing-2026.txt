@@ -1,0 +1,7 @@
+Acme Corp Pricing 2026 (CURRENT)
+
+Effective from: 2026-01-01
+
+Pro plan: 25 dollars per month, billed annually.
+The Pro plan includes priority email support and 200 gigabytes of storage.
+Team plan: 60 dollars per month for up to 5 seats.

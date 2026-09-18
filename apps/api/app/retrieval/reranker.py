@@ -54,6 +54,12 @@ def _rerank_sync(
             return chunks[: min(max_context, 4)]
         return chunks[:max_context]
 
+    # Bound scoring depth (models.yaml: reranker.top_k). The floor at
+    # fusion_top_k is load-bearing: capping below the fused width would
+    # discard candidates before scoring, defeating reranking entirely.
+    depth_cap = max(cfg.reranker_top_k, cfg.fusion_top_k, max_context)
+    candidates = chunks[:depth_cap]
+
     try:
         model = get_reranker()
         if model is None:
@@ -62,10 +68,12 @@ def _rerank_sync(
                 return chunks[: min(max_context, 4)]
             return chunks[:max_context]
 
-        logger.info("Running cross-encoder reranking", model=cfg.reranker_model, count=len(chunks))
+        logger.info(
+            "Running cross-encoder reranking", model=cfg.reranker_model, count=len(candidates)
+        )
 
         # Build query-document input pairs
-        pairs = [(query, c["text"]) for c in chunks]
+        pairs = [(query, c["text"]) for c in candidates]
 
         # Progressive batch scoring with early termination
         # Process in batches and check for early exit conditions
@@ -107,18 +115,18 @@ def _rerank_sync(
 
         # Update scores inside chunks
         for i, score in enumerate(all_scores):
-            chunks[i]["rerank_score"] = float(score)
+            candidates[i]["rerank_score"] = float(score)
 
-        # Sort descending by rerank score
-        chunks.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+        # Sort descending by rerank score — on a copy, never the caller's list.
+        ranked = sorted(candidates, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
 
         # Adaptive Top-K: If top chunks are confident, bound to top 4
         effective_limit = (
             min(max_context, 4)
-            if (len(chunks) > 3 and chunks[0].get("rerank_score", 0.0) >= 0.80)
+            if (len(ranked) > 3 and ranked[0].get("rerank_score", 0.0) >= 0.80)
             else max_context
         )
-        sliced = chunks[:effective_limit]
+        sliced = ranked[:effective_limit]
         logger.debug(
             "Reranking completed",
             top_score=sliced[0]["rerank_score"] if sliced else 0.0,

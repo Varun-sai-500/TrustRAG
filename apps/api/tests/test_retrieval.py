@@ -264,3 +264,39 @@ async def test_hybrid_both_branches_timeout_is_outage(monkeypatch):
     ):
         with pytest.raises(RetrievalOutageError, match="both"):
             await retrieve_hybrid_chunks("outage probe query zeta", "kb_outage_5")
+
+
+@pytest.mark.asyncio
+async def test_hybrid_enforces_fusion_top_k():
+    """Fused candidates are truncated to retrieval.fusion_top_k (default 20)."""
+    from app.core.config import get_model_config
+
+    fusion_top_k = get_model_config().fusion_top_k
+    assert fusion_top_k == 20
+
+    def make_points(prefix: str, count: int) -> list:
+        points = []
+        for i in range(count):
+            point = MagicMock()
+            point.id = f"{prefix}-{i}"
+            point.score = 1.0 - (i * 0.01)
+            point.payload = {"text": f"{prefix} hit {i}"}
+            points.append(point)
+        return points
+
+    with (
+        patch(
+            "app.retrieval.retriever.dense_search",
+            AsyncMock(return_value=make_points("d", 25)),
+        ),
+        patch(
+            "app.retrieval.retriever.sparse_search",
+            AsyncMock(return_value=make_points("s", 25)),
+        ),
+    ):
+        res = await retrieve_hybrid_chunks("fusion bound probe", "kb_fusion_1")
+
+    # 25 dense + 25 sparse (disjoint) fuse to 50; all single-list hits score
+    # 1/(rank+60), so the top 20 are exactly ranks 1..10 of each branch.
+    assert len(res) == fusion_top_k
+    assert {r["id"] for r in res} == {f"d-{i}" for i in range(10)} | {f"s-{i}" for i in range(10)}

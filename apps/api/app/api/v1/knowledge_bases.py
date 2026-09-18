@@ -27,7 +27,7 @@ from app.api.v1.schemas.kb import DocResponse, KBCreate, KBResponse
 from app.core.config import get_model_config, get_settings
 from app.core.exceptions import FileTooLargeError, UnsupportedFormatError
 from app.core.rate_limiter import limiter
-from app.ingestion.chunker import chunk_text
+from app.ingestion.chunking_strategies import get_chunking_strategy
 from app.ingestion.parser import parse_document
 from app.ingestion.pipeline import index_parsed_chunks
 from app.services import kb_service
@@ -84,6 +84,40 @@ async def delete_kb_endpoint(
 ) -> None:
     """Delete knowledge base and all registered documents from DB and vector storage."""
     await kb_service.delete_kb(kb_id, str(current_user["_id"]))
+
+
+@router.post(
+    "/{kb_id}/snapshots",
+    response_model=KBResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Snapshot a knowledge base for rollback",
+)
+async def create_snapshot_endpoint(
+    kb_id: str,
+    version: str = "1.0",
+    current_user: Mapping[str, Any] = Depends(get_current_user),
+) -> KBResponse:
+    """Copy documents, chunks, and vectors into a versioned snapshot KB."""
+    return await kb_service.create_kb_snapshot(kb_id, str(current_user["_id"]), version=version)
+
+
+@router.post(
+    "/{kb_id}/rollback/{snapshot_id}",
+    response_model=KBResponse,
+    summary="Roll back a knowledge base to a snapshot",
+)
+async def rollback_kb_endpoint(
+    kb_id: str,
+    snapshot_id: str,
+    current_user: Mapping[str, Any] = Depends(get_current_user),
+) -> KBResponse:
+    """Restore the snapshot's state as the live KB.
+
+    The restored KB keeps the *snapshot's* id, not the original live id —
+    clients must swap to the returned id. Refuses snapshots with no searchable
+    vectors (409) instead of restoring an empty KB.
+    """
+    return await kb_service.rollback_kb_to_snapshot(kb_id, snapshot_id, str(current_user["_id"]))
 
 
 @router.get(
@@ -165,7 +199,10 @@ async def upload_document_endpoint(
     pages, eff_from, eff_until = await asyncio.to_thread(parse_document, filename, stream)
 
     chunks = await asyncio.to_thread(
-        chunk_text, pages, chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap
+        get_chunking_strategy().chunk,
+        pages,
+        chunk_size=cfg.chunk_size,
+        chunk_overlap=cfg.chunk_overlap,
     )
 
     # Save metadata record in MongoDB
@@ -291,7 +328,10 @@ async def ingest_document_from_url_endpoint(
     pages, eff_from, eff_until = await asyncio.to_thread(parse_document, filename, stream)
 
     chunks = await asyncio.to_thread(
-        chunk_text, pages, chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap
+        get_chunking_strategy().chunk,
+        pages,
+        chunk_size=cfg.chunk_size,
+        chunk_overlap=cfg.chunk_overlap,
     )
 
     # Save metadata record in MongoDB

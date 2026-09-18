@@ -236,8 +236,12 @@ test_*.txt
 # ─── SQLite runtime caches (embedding disk cache, etc.) ───────────────────────
 *.sqlite
 *.sqlite3
+*.db
 *.db-wal
 *.db-shm
+
+# ─── Evaluation run artifacts (runner JSON output; methodology stays tracked) ──
+docs/evaluation/results/
 
 # ─── k6 / load-test raw output ────────────────────────────────────────────────
 load-test/*.har

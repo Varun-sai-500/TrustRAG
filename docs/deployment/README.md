@@ -54,6 +54,7 @@ cp .env.example .env
 | `CACHE_DIR` | No | SQLite embedding + semantic-cache directory |
 | `LOCAL_LLM_MAX_CONCURRENCY` | No | Concurrent local generations, default 1 (raise only on parallel servers) |
 | `AI_PROVIDER`, `EMBEDDING_PROVIDER` (`huggingface`\|`onnx`), `SEARCH_PROVIDER`, `*_MODEL`, `*_BASE_URL`, `EMBEDDING_DIM` | No | Per-deploy overrides; env wins over models.yaml/ports.yaml (see `.env.example`) |
+| `FUSED_DECOMPOSE_VERIFY` | No | `1`/`0` kill-switch for the fused decompose+verify fast path |
 | `MALLOC_ARENA_MAX`, `TOKENIZERS_PARALLELISM` | No | Allocator tuning (`1`, `false`) to cut glibc/tokenizer RAM overhead |
 | `OLLAMA_KV_CACHE_TYPE`, `OLLAMA_FLASH_ATTENTION`, `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_NUM_PARALLEL` | No | Ollama **server** memory tuning — set in the shell before `ollama serve`, not read by the backend |
 
@@ -105,6 +106,10 @@ npm run dev
 ```
 
 > **Embeddings:** TRUSTRAG runs local BGE (384d) embeddings — zero cloud cost, zero keys. `EMBEDDING_PROVIDER=huggingface` (PyTorch, via the `local-models` extra) or `onnx` (torch-free ONNX Runtime; one-time export with `python scripts/export_bge_onnx.py`, then `EMBEDDING_PROVIDER=onnx`). Cloud embeddings were removed. (`EMBEDDING_MODEL` selects between BGE and MiniLM.)
+>
+> **OCR:** scanned/image PDF pages fall back to local RapidOCR-ONNX (`rapidocr-onnxruntime`, a default `pyproject.toml` dependency reusing the shipped `onnxruntime` — no Dockerfile change, no system binaries). Models download once to `~/.onnx` on the first scanned page and are cached afterwards: **pre-warm on deploy** (ingest one scanned PDF) or the first scanned upload stalls on the download. Disable per-deploy with `ingestion.ocr.enabled: false` in `models.yaml` if scanned input is out of scope.
+>
+> **Re-index windows (combine into one operator re-upload):** pre-IDF Qdrant collections recreate empty on next init (sparse values are scoring-incompatible); the newline-preserving normalization change shifts chunk text/embeddings; switching `ingestion.chunking_strategy` changes boundaries. All three require document re-upload.
 
 ---
 
@@ -138,12 +143,14 @@ QDRANT_API_KEY=   # empty = no auth
 
 ---
 
-## Gemini API Setup
+## Gemini API Setup (conditional — only if a Gemini provider/model is selected)
+
+The default stack is fully local (llama.cpp/Ollama + BGE embeddings) and boots with zero keys.
 
 1. Go to [Google AI Studio](https://aistudio.google.com/app/apikey)
 2. Create an API key (free tier available)
 3. Set `GEMINI_API_KEY` in `.env`
-4. Verify the configured model ID (`gemini-3.5-flash-lite` in `config/models.yaml`) is available for your API key
+4. Verify the configured model ID (`gemini-2.5-flash` family in `config/models.yaml`) is available for your API key
 
 > **Model ID verification:** Run `python -c "from app.core.model_registry import get_llm; print(get_llm())"` after setting up credentials.
 
@@ -184,7 +191,7 @@ Deploy directly using `apps/api/Dockerfile`:
 
 ```bash
 docker build -t trustrag-api ./apps/api
-docker run -p 8080:8080 --env-file .env trustrag-api
+docker run -p 8000:8000 --env-file .env trustrag-api
 ```
 
 ---
@@ -282,6 +289,11 @@ When you change the embedding model in `models.yaml`:
 3. Re-ingest documents: delete the old Qdrant collection and re-upload documents
 4. The system will detect embedding version mismatches and warn
 
+The same re-upload applies when the **sparse config changes** (pre-IDF collections
+recreate empty on next init), when **normalization/chunking changes** (chunk text and
+embeddings shift), or when switching **`ingestion.chunking_strategy`**. Combine all
+three into a single operator re-upload window.
+
 ---
 
 ## Troubleshooting
@@ -324,10 +336,10 @@ Cloud embeddings (Gemini/NVIDIA) were removed — embeddings are local-only. Kno
 - Start llama.cpp: `./scripts/start_local_llm.sh` (auto-detects Metal/CUDA)
 - Or start Ollama: `ollama serve` (only needed when `AI_PROVIDER=ollama`)
 
-### Gemini API errors
+### Gemini API errors (only when a Gemini provider/model is selected)
 
 - Verify `GEMINI_API_KEY` is set
-- Verify `gemini-3.5-flash-lite` model is available in your region/plan at [AI Studio](https://aistudio.google.com)
+- Verify the `gemini-2.5-flash` family model ID is available in your region/plan at [AI Studio](https://aistudio.google.com)
 - Check rate limits (Gemini free tier: 15 RPM, 1M tokens/day)
 
 ### CORS errors in browser

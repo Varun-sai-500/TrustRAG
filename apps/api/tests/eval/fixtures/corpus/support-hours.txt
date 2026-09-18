@@ -1,0 +1,7 @@
+Acme Corp Support Hours
+
+Effective from: 2026-01-01
+
+Customer support is available Monday to Friday, 9am to 5pm UTC.
+Pro plan customers receive priority email support with a 4-hour response time.
+Urgent outages can be reported any time through the status page.

@@ -5,7 +5,8 @@
 > - **Backend API**: **Render.com** or **Railway.app** (FastAPI / Docker Container) *(or Koyeb / Google Cloud Run)*
 > - **Primary Database**: MongoDB Atlas (M0 Free Tier or Dedicated Cluster)
 > - **Vector Database**: Qdrant Cloud (Managed Hybrid Vector Engine)
-> - **Foundation Models**: Google Gemini API (`gemini-3.5-flash-lite`)
+> - **Foundation Models**: local-first (llama.cpp/Ollama + BGE/ONNX embeddings, zero keys);
+>   Google Gemini API optional, only when a Gemini provider/model is selected
 
 ---
 
@@ -15,7 +16,7 @@ Deploying in the wrong sequence will cause build and startup failures. Follow th
 
 ```mermaid
 graph TD
-    A["Step 1: Data Plane<br/>(MongoDB Atlas + Qdrant Cloud + Gemini API)"] --> B["Step 2: Backend API<br/>(Render.com / Railway / Cloud Run)"]
+    A["Step 1: Data Plane<br/>(MongoDB Atlas + Qdrant Cloud + optional Gemini API)"] --> B["Step 2: Backend API<br/>(Render.com / Railway / Cloud Run)"]
     B --> C["Step 3: Frontend SPA<br/>(Cloudflare Pages)"]
     C --> D["Step 4: End-to-End Verification<br/>(Health, Auth, Ingest, Agentic RAG)"]
 ```
@@ -56,10 +57,14 @@ graph TD
    - **Cluster Endpoint URL**: e.g., `https://xyz-abc.us-east-1.gcp.cloud.qdrant.io:6333`
 4. Go to **API Keys** and click **Create Key**. Copy the generated API key.
 
-### 1.3 Google AI Studio (Gemini API)
+### 1.3 Google AI Studio (Gemini API — conditional)
+
+Only needed when a Gemini provider/model is selected in `models.yaml`. The default
+stack (llama.cpp/Ollama + local BGE/ONNX embeddings) boots with zero keys.
+
 1. Go to [Google AI Studio API Keys](https://aistudio.google.com/app/apikey).
 2. Click **Create API Key** and copy your `GEMINI_API_KEY`.
-3. Verify access to `gemini-3.5-flash-lite` (standard free quota available).
+3. Verify access to the `gemini-2.5-flash` family (standard free quota available).
 
 ### 1.4 Generate JWT Secret
 Run this in your local terminal to create a cryptographic 64-byte secret:
@@ -151,7 +156,7 @@ Railway provides frictionless GitHub deployments with automatic Dockerfile detec
 2. Click **Create App** → **GitHub** → select `TrustRAG` (branch: `ui-redesign`).
 3. Set **Builder** to **Dockerfile** (path: `apps/api/Dockerfile`).
 4. Set **Environment Variables** (same as above).
-5. Set Health Check: HTTP on path `/api/v1/health` and port `8080`.
+5. Set Health Check: HTTP on path `/api/v1/health` and port `8000`.
 6. Click **Deploy**. Koyeb provisions `https://trustrag-api-<username>.koyeb.app`.
 
 ---
@@ -189,18 +194,14 @@ Test the live health check endpoint on your backend URL (e.g., Render):
 curl -s https://trustrag-api.onrender.com/api/v1/health | jq
 ```
 
-Expected JSON response:
+Expected JSON response (public `/health` is minimal by design — services, models,
+and supported formats live behind auth at `/health/detailed`):
 ```json
 {
   "status": "ok",
+  "timestamp": "2026-09-16T00:00:00+00:00",
   "app": "TRUSTRAG",
-  "version": "0.1.0",
-  "environment": "production",
-  "services": {
-    "mongodb": "ok",
-    "qdrant": "ok"
-  },
-  "supported_formats": ["pdf", "txt", "md", "docx", "csv", "json", "html", "htm"]
+  "version": "0.1.0"
 }
 ```
 
@@ -286,6 +287,8 @@ Perform a complete workflow verification on your live Cloudflare Pages URL:
    - Navigate to `/knowledge-bases`.
    - Click **New Knowledge Base** → name it `Compliance & Security`.
    - Upload any sample document (`.pdf`, `.docx`, `.csv`, `.json`, `.html`, or `.txt`).
+   - Scanned/image PDFs trigger the local RapidOCR-ONNX fallback (models download
+     once to `~/.onnx` — pre-warm with one scanned upload so users never stall).
    - Verify status transitions from `pending` → `completed`.
 5. **Run Agentic Analysis in Playground**:
    - Go to `/playground`.
@@ -302,7 +305,7 @@ Perform a complete workflow verification on your live Cloudflare Pages URL:
 
 | Issue / Topic | Description & Solution |
 | :--- | :--- |
-| **Instant Cold Starts** | TRUSTRAG uses local 384d BGE embeddings (`BAAI/bge-small-en-v1.5`) — zero API keys, zero cloud calls. The ~120MB weights download once on first boot; the API warms them in the background so the port binds instantly. |
+| **Instant Cold Starts** | TRUSTRAG uses local 384d BGE embeddings (`BAAI/bge-small-en-v1.5`) — zero API keys, zero cloud calls. The ~120MB weights download once on first boot; the API warms them in the background so the port binds instantly. Separate one-time downloads: the ONNX path needs its exported file copied in (see `model_cache` volume), and OCR models fetch to `~/.onnx` on the first scanned page — neither is pre-warmed, so ingest one scanned PDF right after deploy. |
 | **MongoDB Atlas Free Tier Sleep** | M0 clusters auto-pause on inactivity. TRUSTRAG's `mongodb.py` includes a 2.5-minute exponential backoff retry loop that waits for Atlas to wake up without crashing the container. |
 | **Cloudflare Pages SPA 404s** | [`apps/web/public/_redirects`](apps/web/public/_redirects) routes `/* /index.html 200`. Direct page refreshes on `/playground`, `/evidence`, etc., will never throw 404 errors. |
 | **Qdrant Authentication** | In `APP_ENV=production`, `QDRANT_API_KEY` is strictly required by Pydantic validator. Ensure your Qdrant Cloud key is set. |

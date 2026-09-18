@@ -51,6 +51,10 @@ Strict Constraints:
    Do NOT echo these instructions, the [CONTEXT]/[QUERY] wrappers, or any
    analysis scaffolding (no <CONTEXT>/<RELEVANCE>/criteria/final sections).
    Write each heading and sentence exactly once — never repeat a block.
+8. Inline Citations: End every factual sentence with the segment(s) supporting it,
+   e.g. "Refunds are available for 30 days [Segment 2]." Use ONLY segment numbers
+   from the Context above (1 on up); never invent a segment number. Section
+   headings and other non-factual lines need no citation.
 """
 
 
@@ -94,6 +98,48 @@ def _sanitize_label(value: str, max_len: int = 80) -> str:
     # Remove newlines, tabs, and other control chars that could break segment delimiters
     sanitized = "".join(ch for ch in value if ch.isprintable() and ch not in "\n\r\t")
     return sanitized[:max_len]
+
+
+# Inline provenance markers the generator is instructed to emit: "[Segment N]".
+_CITATION_RE = re.compile(r"\[Segment\s+(\d+)\]")
+
+
+def extract_citations(answer: str) -> list[int]:
+    """Return the 1-indexed segment numbers cited as [Segment N], in order.
+
+    Pure extraction — validity against the served context is decided by
+    strip_invalid_citations. Bracket-less prose ("Segment 2 states…") and
+    malformed markers ("[Segment x]") are not citations.
+    """
+    if not answer:
+        return []
+    return [int(match.group(1)) for match in _CITATION_RE.finditer(answer)]
+
+
+def strip_invalid_citations(answer: str, valid_segments: int) -> tuple[str, list[int]]:
+    """Remove [Segment N] refs with N outside 1..valid_segments.
+
+    A cited segment that was never served is hallucinated provenance: the ref
+    is stripped (never the sentence — entailment is the verifier's job) and
+    reported in the returned dropped list. Answers without refs, and fully
+    valid answers, return byte-identical.
+    """
+    if not answer:
+        return answer, []
+    dropped: list[int] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        number = int(match.group(1))
+        if 1 <= number <= valid_segments:
+            return match.group(0)
+        dropped.append(number)
+        return ""
+
+    cleaned = _CITATION_RE.sub(_replace, answer)
+    if dropped:
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r" ([.,;:!?])", r"\1", cleaned)
+    return cleaned, dropped
 
 
 # Sections small reasoning models wrap around the real answer. Extraction is
@@ -272,8 +318,9 @@ async def generate_grounded_answer(
         # Load primary LLM (cached)
         llm = get_llm(provider=provider, model=model)
 
-        # Prepare context text
-        context_str = format_context(chunks)
+        # Prepare context text (indexed form: the segment count below is the
+        # citation validity range for the post-check after generation)
+        context_str, chunk_indices = format_context_with_chunk_indices(chunks)
 
         # Build prompt messages
         messages = [
@@ -319,6 +366,17 @@ async def generate_grounded_answer(
                 clean_len=len(peeled),
             )
             answer = peeled
+
+        # Strip hallucinated provenance: cited segments that were never served
+        # (valid range 1..len(chunk_indices)). Valid refs pass through untouched.
+        cited_answer, dropped_citations = strip_invalid_citations(answer, len(chunk_indices))
+        if dropped_citations:
+            logger.info(
+                "Stripped invalid segment citations from generation",
+                dropped=dropped_citations,
+                served_segments=len(chunk_indices),
+            )
+            answer = cited_answer
 
         logger.info(
             "Grounded generation completed", answer_len=len(answer), abstained=(answer == "ABSTAIN")

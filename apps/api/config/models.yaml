@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 runtime:
-  config_version: "1.7"
+  config_version: "1.13"
 
 # ─── LLM ──────────────────────────────────────────────────────────────────────
 llm:
@@ -86,7 +86,12 @@ reranker:
   enabled: false            # Start disabled; enable after retrieval baseline
   provider: cross_encoder   # cross-encoder via sentence-transformers (free)
   model: cross-encoder/ms-marco-MiniLM-L-6-v2
-  top_k: 8
+  # Max candidates scored per query (cost bound). MUST stay >= fusion_top_k:
+  # capping below the fused width discards candidates before scoring.
+  # NOTE: sentence-transformers ships in the `local-models` extra, NOT the
+  # torch-free Docker runtime — enabling in Docker is a silent no-op
+  # (get_reranker returns None → RRF order) until the image carries torch.
+  top_k: 20
 
 # ─── Retrieval ────────────────────────────────────────────────────────────────
 retrieval:
@@ -96,11 +101,24 @@ retrieval:
   rrf_k: 60                 # RRF constant (standard default)
   fusion_top_k: 20
   max_context_chunks: 8     # Maximum evidence chunks sent to LLM
+  # Deterministic query router (no LLM): simple → 1 call; temporal → 1 call +
+  # reference_time; comparison/complex → bounded parallel fan-out merged by RRF.
+  query_router:
+    enabled: true
+    max_sub_queries: 3      # Fan-out ceiling per retrieval round (≤2× base for comparisons)
+  # BM25-style client TF for the sparse leg (Qdrant applies IDF server-side
+  # via the Modifier.IDF sparse config — see app/db/qdrant.py). Standard defaults.
+  sparse_k1: 1.2             # Term-frequency saturation
+  sparse_b: 0.75             # Length-normalization strength
+  sparse_avg_len_tokens: 128 # Reference length ≈ default 512-char chunk
 
 # ─── Document Processing ──────────────────────────────────────────────────────
 ingestion:
   chunk_size: 512           # Characters per chunk (approx. 128 tokens)
   chunk_overlap: 64         # Windows snap to word boundaries (see chunker.py)
+  # Chunking strategy: sliding_window (default), semantic, progressive, layout_aware.
+  # Non-default strategies change chunk boundaries → re-index KBs after switching.
+  chunking_strategy: sliding_window
   # Supported document formats
   supported_formats:
     - pdf
@@ -114,6 +132,15 @@ ingestion:
   max_file_size_mb: 20
   # Maximum file size for processing (deny-of-wallet defense)
   max_total_tokens_per_doc: 200000
+  # OCR fallback (RapidOCR-ONNX): native extraction stays the default; only
+  # pages with less than min_native_chars of native text are OCR-rendered.
+  # Page text below min_confidence is dropped (never becomes evidence).
+  ocr:
+    enabled: true
+    engine: rapidocr-onnx
+    min_native_chars: 50
+    dpi: 300
+    min_confidence: 0.5
 
 # ─── Reliability Engine ───────────────────────────────────────────────────────
 # These are engineering defaults — NOT calibrated probabilities.
@@ -122,9 +149,8 @@ reliability:
   minimum_evidence_coverage: 0.80   # Fraction of claims needing support
   maximum_contradiction_rate: 0.20  # Max fraction of contradicted claims
   abstain_below: 0.50               # Reliability score below which to abstain
-  citation_correctness_weight: 0.30 # Weight in composite score
-  evidence_coverage_weight: 0.40
-  source_integrity_weight: 0.30
+  # NOTE: composite weights removed in Phase 5 — compute_verdict uses
+  # coverage/contradiction only; untuned weights were a tuning trap.
 
 # ─── Recovery Policy ──────────────────────────────────────────────────────────
 recovery:
@@ -140,9 +166,12 @@ cost_controls:
   max_input_tokens: 100000          # Hard limit per LLM call
   max_verification_claims: 8        # Small models choke on 20; 8 keeps NLI focused
   max_individual_nli_fallback: 8    # Must cover max_verification_claims (8): when
-                                     # batch NLI fails, every claim is still attempted
-                                     # individually instead of auto-NEUTRAL trailing
-                                     # claims that were never even tried.
+                                      # batch NLI fails, every claim is still attempted
+                                      # individually instead of auto-NEUTRAL trailing
+                                      # claims that were never even tried.
+  max_claim_retrievals: 3             # Targeted-retrieval budget: at most this many
+                                      # NEUTRAL claims get one extra retrieval + NLI each
+  claim_retrieval_top_k: 5            # Candidate depth per targeted claim retrieval
   enable_response_caching: true     # Semantic response caching enabled
 
 # ─── Inference Acceleration & KV Cache Optimization ───────────────────────────

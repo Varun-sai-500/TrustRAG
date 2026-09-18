@@ -8,7 +8,7 @@
 [![Ollama](https://img.shields.io/badge/Ollama-Local_Offline-000000?logo=ollama&logoColor=white)](https://ollama.com)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-GGUF_Server-orange)](https://github.com/ggerganov/llama.cpp)
 [![ONNX Runtime](https://img.shields.io/badge/ONNX%20Runtime-Embeddings-005CED?logo=onnx&logoColor=white)](https://onnxruntime.ai)
-[![Tests](https://img.shields.io/badge/Backend%20Tests-219%20Passing-brightgreen)](apps/api/tests)
+[![Tests](https://img.shields.io/badge/Backend%20Tests-326%20Passing-brightgreen)](apps/api/tests)
 [![Tests](https://img.shields.io/badge/Frontend%20Tests-22%20Passing-brightgreen)](apps/web)
 [![E2E](https://img.shields.io/badge/Playwright%20E2E-2%20Passing-brightgreen)](apps/web/e2e)
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
@@ -134,12 +134,12 @@ Each stage below names the code that runs it and the `config/models.yaml` knob t
 
 | # | Stage | What happens | Key knobs |
 |---|---|---|---|
-| 1 | **Normalize & zone** | Noise cleanup, hyphen repair, filler stripping; text split into ~512-char chunks (64-char overlap, word-boundary snapped) with zone tags — titles/headers score higher than body | `ingestion.chunk_size: 512`, `chunk_overlap: 64` |
-| 2 | **Hybrid retrieval** | Dense vectors (`BAAI/bge-small-en-v1.5`, 384d — HuggingFace/torch or torch-free ONNX Runtime via `EMBEDDING_PROVIDER=onnx`) + BM25 sparse vectors fused with Reciprocal Rank Fusion; embedding model is **pinned per KB at ingest** | `retrieval.dense_top_k: 20`, `sparse_top_k: 20`, `rrf_k: 60`, `fusion_top_k: 20` |
-| 3 | **Rerank (optional)** | Cross-encoder rescoring of fused candidates; **off by default** until you baseline retrieval quality | `reranker.enabled: false`, `model: cross-encoder/ms-marco-MiniLM-L-6-v2`, `top_k: 8` |
+| 1 | **Normalize & zone** | Noise cleanup, hyphen repair, filler stripping (paragraph breaks preserved for section/table detection); text split into ~512-char chunks (64-char overlap, word-boundary snapped) with zone tags — titles/headers score higher than body. Chunking strategy selectable (`sliding_window` default, `semantic`, `progressive`, `layout_aware`). Scanned/image PDF pages fall back to **local RapidOCR-ONNX** — on by default, per-page under 50 native chars, 300 dpi render, sub-0.5-confidence text dropped — with `ocr_used`/`ocr_confidence` provenance on every chunk | `ingestion.chunk_size: 512`, `chunk_overlap: 64`, `chunking_strategy`, `ingestion.ocr.enabled/min_native_chars/dpi/min_confidence` |
+| 2 | **Hybrid retrieval** | A deterministic router classifies each query first — simple (one hybrid call), temporal (explicit year → reference time), comparison (`A vs B` → two parallel retrievals), complex (multi-question split, capped). Dense vectors (`BAAI/bge-small-en-v1.5`, 384d — HuggingFace/torch or torch-free ONNX Runtime via `EMBEDDING_PROVIDER=onnx`) + BM25 sparse vectors (client TF-saturation, server-side IDF via Qdrant `Modifier.IDF`) fused with Reciprocal Rank Fusion (capped at `fusion_top_k`); embedding model is **pinned per KB at ingest** | `retrieval.dense_top_k: 20`, `sparse_top_k: 20`, `rrf_k: 60`, `fusion_top_k: 20`, `sparse_k1/b`, `query_router.max_sub_queries: 3` |
+| 3 | **Rerank (optional)** | Cross-encoder rescoring of fused candidates (≤20 scored via `reranker.top_k` depth cap, ≤8 to context, adaptive top-4 on confident heads); **off by default** — enable only where `sentence-transformers` is installed (`local-models` extra; absent from the torch-free Docker runtime, where enabling is a silent no-op) | `reranker.enabled: false`, `model: cross-encoder/ms-marco-MiniLM-L-6-v2`, `top_k: 20` |
 | 4 | **Integrity audit** | SHA-256 tamper check per chunk + temporal validity windows (`effective_from`/`effective_until`); corrupted segments are excluded before generation | — (always on) |
-| 5 | **Grounded generation** | Answer strictly conditioned on ≤8 surviving chunks within a 3000-char context budget (fits small-model windows); empty/insufficient context → `ABSTAIN`, never a guess | `retrieval.max_context_chunks: 8`, `llm.temperature: 0.2` |
-| 6 | **Claim decomposition + NLI** | Answer split into ≤8 atomic, self-contained claims; each judged `SUPPORTED` / `CONTRADICTED` / `NEUTRAL` against the evidence in one batch call, with full per-claim fallback if the batch fails | `cost_controls.max_verification_claims: 8`, `max_individual_nli_fallback: 8`, `verification.temperature: 0.0` |
+| 5 | **Grounded generation** | Answer strictly conditioned on ≤8 surviving chunks within a 3000-char context budget (fits small-model windows); every factual sentence carries inline `[Segment N]` citations, and refs to unserved segments are stripped post-generation; empty/insufficient context → `ABSTAIN`, never a guess | `retrieval.max_context_chunks: 8`, `llm.temperature: 0.2` |
+| 6 | **Claim decomposition + NLI** | Answer split into ≤8 atomic, self-contained claims; each judged `SUPPORTED` / `CONTRADICTED` / `NEUTRAL` against the evidence in one batch call, with full per-claim fallback if the batch fails. NEUTRAL claims (missing evidence — never CONTRADICTED) get one bounded targeted-retrieval round each (claim text as query, top-5, ≤3/analysis) | `cost_controls.max_verification_claims: 8`, `max_individual_nli_fallback: 8`, `max_claim_retrievals: 3`, `claim_retrieval_top_k: 5`, `verification.temperature: 0.0` |
 | 7 | **Verdict & recovery** | Coverage/contradiction scored against thresholds (see below); on FAIL one recovery round runs, then either a grounded answer or safe `ABSTAIN` | `reliability.*`, `recovery.max_recovery_attempts: 1` |
 
 > **Single-document note:** with one short document, any query retrieves roughly the same chunks. If verification still fails 0/8, suspect the NLI judge or truncated context — not retrieval. Check the Claims tab explanations and the analysis trace.
@@ -508,12 +508,12 @@ TrustRAG/
 │   │   │   ├── core/               # Config, logging, security, model registry, ONNX embeddings, memory guard
 │   │   │   ├── db/                 # MongoDB (async) & Qdrant clients
 │   │   │   ├── generation/         # LLM prompts and grounded generation
-│   │   │   ├── ingestion/          # PDF/DOCX/TXT/MD/CSV/JSON/HTML parsers, chunker
-│   │   │   ├── retrieval/          # Dense search, BM25, RRF fusion
+│   │   │   ├── ingestion/          # PDF/DOCX/TXT/MD/CSV/JSON/HTML parsers, chunker, OCR fallback
+│   │   │   ├── retrieval/          # Dense search, BM25, RRF fusion, reranker
 │   │   │   ├── services/           # Business logic: KB, analysis, auth
 │   │   │   └── verification/       # Batch NLI verifier & SHA-256 auditor
 │   │   ├── config/models.yaml      # Model IDs, thresholds, tuning
-│   │   └── tests/                  # 219 tests (all passing)
+│   │   └── tests/                  # 326 tests (all passing: eval, sparse_bm25, qdrant, ocr, reranker, router, citations, claim-retrieval, lifecycle, delete-safety + core suites)
 │   │
 │   └── web/                        # React 18 + Vite 6 frontend
 │       ├── src/
@@ -529,7 +529,7 @@ TrustRAG/
 │   ├── audits/                     # Unified senior audit (2026-09-11)
 │   ├── deployment/                 # Deployment guide
 │   ├── security/                   # Threat model, security controls
-│   └── evaluation/                 # Methodology
+│   └── evaluation/                 # Methodology + frozen baseline (25 queries) + metrics harness + live runner
 │
 ├── scripts/
 │   ├── discover_local_models.py    # Pre-boot model discovery snapshot
@@ -570,12 +570,14 @@ Base URL: `http://localhost:8000/api/v1`. Interactive docs at `/docs`. Auth is B
 | `POST /knowledge-bases` | Create a KB |
 | `GET /knowledge-bases` | List your KBs |
 | `GET /knowledge-bases/{kb_id}` | KB metadata |
-| `DELETE /knowledge-bases/{kb_id}` | Delete a KB (cascades) |
+| `DELETE /knowledge-bases/{kb_id}` | Delete a KB (cascades; vectors dropped first so a failure keeps metadata for retry) |
+| `POST /knowledge-bases/{kb_id}/snapshots` | Snapshot a KB for rollback (201) |
+| `POST /knowledge-bases/{kb_id}/rollback/{snapshot_id}` | Roll back to a snapshot — returns the NEW live id, clients must swap (409 on vector-less snapshots) |
 | `GET /knowledge-bases/{kb_id}/documents` | List documents in a KB |
 | `POST /knowledge-bases/{kb_id}/documents` | Upload a document (.pdf/.txt/.md/.docx/.csv/.json/.html) |
 | `POST /knowledge-bases/{kb_id}/documents/from-url` | Ingest a document from URL |
 | `GET /documents/{doc_id}` | Document details |
-| `DELETE /documents/{doc_id}` | Delete a document |
+| `DELETE /documents/{doc_id}` | Delete a document (fails closed on vector errors — record kept for retry, never orphaned points) |
 
 ### Analyses — the RAG pipeline
 
@@ -614,7 +616,7 @@ Two files own all non-secret config. **Env vars always win** over both.
 
 | File | Owns | Example knobs |
 |---|---|---|
-| `apps/api/config/models.yaml` | Model IDs, thresholds, tuning | LLM/embedding model IDs, `retrieval.*`, `reliability.*`, `recovery.*`, `cost_controls.*`, `optimization.*` |
+| `apps/api/config/models.yaml` (`config_version: 1.13`) | Model IDs, thresholds, tuning | LLM/embedding IDs, `retrieval.*` (incl. `sparse_k1/b`, `query_router.*`), `reranker.*` (off by default, `top_k: 20` depth cap), `ingestion.*` (incl. `chunking_strategy`, `ocr.*`), `reliability.*`, `recovery.*`, `cost_controls.*` (incl. `max_claim_retrievals`, `claim_retrieval_top_k`), `verification.*`, `optimization.*` |
 | `config/ports.yaml` | Ports + derived base URLs | backend `8000`, frontend `5173`, Ollama `11434`, llama.cpp `8080`, MongoDB `27017`, Qdrant `6335:6333` host:container |
 
 Change a port in `ports.yaml`, then run `python3 scripts/apply_ports.py` (CI enforces with `--check`).
@@ -646,7 +648,7 @@ Change a port in `ports.yaml`, then run `python3 scripts/apply_ports.py` (CI enf
 
 ## Testing
 
-TrustRAG has 219 backend tests, 22 frontend tests, and 2 E2E tests — all passing.
+TrustRAG has 326 backend tests, 22 frontend tests, and 2 E2E tests — all passing.
 
 **Backend (same on all three OSes — run from Git Bash on Windows):**
 ```bash
@@ -709,7 +711,18 @@ k6 run load-test/smoke.js
 | `test_generation.py` | Grounded answer generation, ABSTAIN rules, scaffold stripping |
 | `test_verification.py` | Claim decomposition, fused + batch/individual NLI, tolerant near-miss parsing, fallback budget, verdict math |
 | `test_integrity.py` | SHA-256 evidence audit, temporal windows |
-| `test_retrieval.py` / `test_preprocessor.py` / `test_ingestion.py` | Hybrid retrieval, text normalization, chunking, ingestion pipeline |
+| `test_retrieval.py` / `test_preprocessor.py` / `test_ingestion.py` | Hybrid retrieval, fusion_top_k bound, text normalization, chunking, ingestion pipeline |
+| `tests/eval/` (`test_eval_metrics.py`, `test_baseline_dataset.py`) | Phase-0 harness: metric math (hand-computed), frozen 25-query dataset schema + fixture-snippet validation |
+| `test_sparse_bm25.py` | BM25 TF saturation, length norm, query-side weights, zone ordering |
+| `test_qdrant.py` | Collection init + IDF sparse migration (create/keep/recreate/fail-open) |
+| `test_ocr.py` | OCR density gate, confidence drop, fail-open parsing, provenance plumbing (mocked engine) |
+| `test_reranker.py` | Enabled-path scoring/adaptive top-4/depth cap + disabled/None/exception fallbacks (mocked CrossEncoder) |
+| `test_chunking_strategies.py` | Newline-preserving normalization, strategy wiring, semantic true offsets, progressive gap-freedom, layout table grouping + order, OCR passthrough |
+| `test_citations.py` | Inline `[Segment N]` extraction, invalid-ref stripping matrix, end-to-end generation wiring (mocked LLM) |
+| `test_claim_retrieval.py` | Targeted per-claim retrieval (dedup, budget, outage), NEUTRAL→SUPPORTED flip with fresh linkage, CONTRADICTED exclusion, inline-cite union |
+| `test_router.py` | Router classify/split/merge matrix, fan-out concurrency + outage degradation, node-level comparison fan-out |
+| `test_lifecycle.py` | Snapshot/rollback routes, empty-snapshot 409 guard, OCR-preserving snapshots, document-delete vector purge |
+| `test_delete_safety.py` | Fail-closed deletes (vectors-before-metadata ordering, no swallowed vector errors), router cap floor |
 | `test_local_llm.py` / `test_hardware.py` | Ollama/llama.cpp clients, model registry, hardware profiles |
 | `test_disk_cache.py` / `test_semantic_cache.py` | Embedding disk cache, semantic answer cache |
 | `test_rate_limit.py` | Per-route rate limiting |

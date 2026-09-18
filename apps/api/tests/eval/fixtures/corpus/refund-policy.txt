@@ -1,0 +1,8 @@
+Acme Corp Refund Policy
+
+Effective from: 2026-01-01
+
+All purchases are eligible for a full refund within 30 days of delivery.
+To request a refund, contact billing@acme.example with your order number.
+Refunds are issued to the original payment method within 5 business days.
+Digital downloads are refundable only if unopened and requested within 7 days.

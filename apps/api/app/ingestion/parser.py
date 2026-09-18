@@ -136,14 +136,55 @@ def extract_dates(text: str) -> tuple[datetime | None, datetime | None]:
 def parse_pdf(stream: BinaryIO) -> list[dict[str, Any]]:
     """
     Parse a PDF file page-by-page.
-    Returns a list of dicts: [{"page": page_num, "text": page_text}].
+    Returns a list of dicts: [{"page": page_num, "text": page_text,
+    "ocr_used": bool, "ocr_confidence": float | None}].
+
+    Pages with sufficient native text keep native extraction. Pages below the
+    native-text density threshold fall back to RapidOCR-ONNX (ingestion.ocr.*)
+    when enabled. OCR failures fail open to whatever native text exists.
     """
+    from app.core.config import get_model_config
+    from app.ingestion import ocr as ocr_module
+
+    cfg = get_model_config()
     try:
         with fitz.open(stream=stream.read(), filetype="pdf") as doc:
             pages = []
             for i, page in enumerate(doc):
-                text = page.get_text()
-                pages.append({"page": i + 1, "text": text.strip()})
+                native_text = page.get_text().strip()
+                text, ocr_used, ocr_confidence = native_text, False, None
+                if cfg.ocr_enabled and ocr_module.should_ocr_page(
+                    native_text, cfg.ocr_min_native_chars
+                ):
+                    try:
+                        pix = page.get_pixmap(dpi=cfg.ocr_dpi)
+                        ocr_result = ocr_module.ocr_image_bytes(
+                            pix.tobytes("png"),
+                            min_confidence=cfg.ocr_min_confidence,
+                        )
+                        text = ocr_result.text.strip()
+                        ocr_used, ocr_confidence = True, ocr_result.confidence
+                        logger.info(
+                            "OCR fallback used for PDF page",
+                            page=i + 1,
+                            confidence=ocr_confidence,
+                        )
+                    except Exception as exc:
+                        # Fail open: a broken OCR page must not kill ingestion
+                        # of the whole document; keep whatever native text exists.
+                        logger.warning(
+                            "OCR fallback failed; keeping native page text",
+                            page=i + 1,
+                            error=str(exc),
+                        )
+                pages.append(
+                    {
+                        "page": i + 1,
+                        "text": text,
+                        "ocr_used": ocr_used,
+                        "ocr_confidence": ocr_confidence,
+                    }
+                )
             return pages
     except Exception as exc:
         raise IngestionError("Failed to parse PDF document", detail=str(exc)) from exc

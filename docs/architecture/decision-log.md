@@ -122,7 +122,7 @@ Any deviation from the specification must be logged here with rationale.
 ## D-10: sentence-transformers/all-MiniLM-L6-v2 for embeddings (local, free)
 
 **Date:** 2026-08-27  
-**Status:** Accepted  
+**Status:** Superseded by D-12, then D-19 (local-only BGE-small), then D-21 (ONNX)  
 **Phase:** 0
 
 **Decision:** Embeddings are generated locally using `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions). No external embedding API. Model is downloaded once and cached.
@@ -141,6 +141,8 @@ Any deviation from the specification must be logged here with rationale.
 
 **Decision:** The configured model ID is `gemini-2.5-flash` (or `gemini-3.5-flash-lite`). The user requested "Gemini 3.5 Flash" which does not exist as a published model ID. `gemini-2.5-flash` is the current free-tier Flash generation model.
 
+**Amendment 2026-09-16:** the LLM is now multi-provider and selectable per request (llama.cpp default, Ollama, Gemini, NVIDIA). The Gemini IDs above apply only when the Gemini provider is selected.
+
 **Action required:** Verify the exact model ID at [Google AI Studio](https://aistudio.google.com/app/apikey) before deployment and update `models.yaml` if needed.
 
 ---
@@ -148,7 +150,7 @@ Any deviation from the specification must be logged here with rationale.
 ## D-12: Google Gemini 384d MRL Embeddings & PyTorch Decoupling (Supersedes D-10)
 
 **Date:** 2026-08-30  
-**Status:** Accepted & Implemented  
+**Status:** Superseded by D-19 (local-only embeddings)  
 **Phase:** 13
 
 **Decision:** Transition default embeddings from local PyTorch `sentence-transformers` to cloud-native Google Gemini `models/gemini-embedding-001` with Matryoshka Representation Learning truncated to 384 dimensions (`output_dimensionality: 384`). Move PyTorch and `sentence-transformers` to optional extras (`[project.optional-dependencies] local-models`).
@@ -178,7 +180,7 @@ Any deviation from the specification must be logged here with rationale.
 ## D-14: Default Port Migration to 8080
 
 **Date:** 2026-08-31  
-**Status:** Accepted & Implemented  
+**Status:** Superseded by D-18 (backend 8000, llama.cpp 8080)  
 **Phase:** 14
 
 **Decision:** Change default FastAPI backend port from `8000` to `8080` across all configurations (`main.py`, `Dockerfile`, `docker-compose.yml`, `vite.config.js` proxy, and documentation).
@@ -273,6 +275,10 @@ project. Embeddings are local-only (`huggingface`: `BAAI/bge-small-en-v1.5`,
 - No per-token embedding cost, no quota exhaustion inside the ingestion/retrieval hot path.
 - One embedding space per deployment kills an entire class of cross-provider vector contamination bugs.
 - Existing KBs indexed with retired providers must be re-uploaded (backend fails closed with instructions; UI directs to re-upload).
+
+**Amendment 2026-09-16:** pre-IDF collections likewise need document re-upload
+(recreate-on-mismatch in `init_kb_collection`), and the newline-preserving
+normalization change requires a re-index — combine all three into one re-upload window.
 
 **Files:**
 - `apps/api/app/core/model_registry.py` (branches removed, retired-provider guard)
@@ -402,3 +408,115 @@ JSON example.
 
 **Consequences:** Backend 199 tests pass. Previously-NEUTRAL-but-correct
 judgments now count; genuine no-support cases still read NEUTRAL.
+
+**Amendment 2026-09-16:** fused decompose+verify fast path (one structured call,
+kill-switch `verification.fused_decompose_verify`); meta-filter `(?<!\[)` lookbehind so
+Phase-4 `[Segment N]` citations survive while bare "Segment 2 states…" prose still drops.
+
+---
+
+## D-23: BM25-Style Sparse Vectors + Server-Side IDF (Phase 1)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (`models.yaml` v1.7 → v1.8)
+
+**Decision:** The sparse leg was linear TF (`freq/total_tokens`) with no IDF — rare and
+common terms weighted equally. Client vectors now carry BM25 TF saturation
+(`zone × sat(freq)/length-norm`, k1=1.2/b=0.75/avg_len=128 tokens, all tunable), and the
+`sparse-text` collection uses Qdrant `Modifier.IDF` (IDF from index statistics at query
+time). `fusion_top_k` (previously configured but never read) is now enforced post-RRF,
+post-temporal. Pre-IDF collections are deleted and recreated empty on next init
+(vectors are scoring-incompatible) — operators re-upload those KBs.
+
+## D-24: Reranker Stays Disabled + Depth Cap (Phase 2)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (`models.yaml` v1.8 → v1.9)
+
+**Decision:** The cross-encoder path already existed, only disabled. Enablement stays
+`false`: the torch-free Docker runtime lacks `sentence-transformers` by design, so
+enabling there is a silent no-op (`get_reranker` → None → RRF order). Shipped instead:
+dead `reranker.top_k` wired as the scoring-depth cap (default 8 → 20, floored at
+`fusion_top_k` so candidates are never discarded pre-score), no-in-place-sort fix, and
+full enabled-path tests behind mocks. Thresholds remain uncalibrated pending the live
+Hybrid-vs-Hybrid+Rerank ablation. Enable only where the `local-models` extra is installed.
+
+## D-25: RapidOCR-ONNX Per-Page Fallback, Default On (OCR)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (`models.yaml` v1.8 → v1.9)
+
+**Decision:** Native extraction stays the default; only pages with <50 native chars are
+rendered (300 dpi) through RapidOCR-ONNX. Rejected: Surya (GPL code + non-commercial
+model weights — licensing risk), Docling (replaces the parser instead of improving it),
+full PaddleOCR (drags the PaddlePaddle framework), VLM OCR (GPU + hallucination risk in
+evidence text). RapidOCR reuses the shipped `onnxruntime`, needs no system binaries and
+no Dockerfile change. Sub-0.5-confidence page text is dropped (never becomes evidence)
+while `ocr_used=True` preserves auditability; failures fail open to native text.
+`ocr_used`/`ocr_confidence` ride page → chunk → Mongo + Qdrant payload. Models download
+once to `~/.onnx` on first use — NOT pre-warmed; pre-warm on deploy or the first scanned
+upload stalls.
+
+## D-26: Newline-Preserving Normalization + Selectable Chunking (Phase 3)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (`models.yaml` v1.10 → v1.11)
+
+**Decision:** Root cause: `normalize_text` collapsed `\s+` → `" "`, erasing newlines and
+silently disabling section splits, table-line detection, and the all-caps header branch.
+Whitespace collapse now preserves `\n\n` breaks (token stream identical — the lexer treats
+all whitespace as separators). Fixed alongside: semantic true offsets (were all reset to
+0), progressive step scaling (fixed full-size step skipped ~80 chars/window — silent text
+loss), layout rewrite (ordered blocks, tables chunked once with sequential indices),
+OCR flag passthrough, and strategy wiring at both ingest paths
+(`ingestion.chunking_strategy`, default `sliding_window` = byte-identical output).
+Chunk text/embeddings shift → re-index KBs (combine with the D-23 re-upload window).
+Known limitation: plain-text ALL-CAPS headings stay invisible post-lowercase.
+
+## D-27: Inline `[Segment N]` Citations + Existence Post-Check (Phase 4)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (prompt-only, no `models.yaml` change)
+
+**Decision:** The grounding prompt requires `[Segment N]` per factual sentence; a pure
+post-check strips refs to unserved segments (whitespace tidied, sentences untouched —
+entailment stays the verifier's job). Ref-free answers pass through byte-identical, so
+the KV-cache prompt prefix stays stable run to run. The eval runner scores citation
+*existence* live; entailment scoring waits for claim-level verification.
+
+## D-28: NEUTRAL-Only Targeted Claim Retrieval; Dead Weights Deleted (Phase 5)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (`models.yaml` v1.11 → v1.12)
+
+**Decision:** NEUTRAL claims (missing evidence) get one bounded targeted round each —
+claim text as query, top-5, max 3 per analysis — with fresh mini-context re-verification
+and persisted evidence linkage. CONTRADICTED claims are never re-searched (existing
+evidence refutes them; re-searching would cherry-pick). Deleted the unread
+`citation/evidence-coverage/source-integrity_weight` trio (tuning trap, zero readers).
+
+## D-29: Deterministic Query Router + Bounded Fan-Out (Phase 6)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (`models.yaml` v1.12 → v1.13)
+
+**Decision:** Pre-retrieval regex router (no LLM): simple → today's single call verbatim;
+temporal → explicit year becomes a July-1 reference_time; comparison (`A vs B`) → two
+parallel retrievals merged by RRF; multi-`?` → deterministic per-question split capped
+at 3. Unsplittable input falls back to SIMPLE (never worse than today). Partial branch
+outage degrades; total outage still raises. Removed the zero-caller `AmbiguityDetector`
+(post-retrieval entropy heuristic, superseded). LLM sub-question decomposition explicitly
+deferred until live eval shows deterministic splitting is insufficient.
+
+## D-30: Snapshot/Rollback Routes + Empty-Snapshot Guard (Phase 8)
+
+**Date:** 2026-09-16
+**Status:** Accepted & Implemented (no `models.yaml` change)
+
+**Decision:** Exposed the existing snapshot/rollback service surface:
+`POST /knowledge-bases/{id}/snapshots` → 201,
+`POST /knowledge-bases/{id}/rollback/{snap}` → 200 with the NEW live id (snapshot's —
+clients must swap). Rollback refuses vector-less (pre-vector-copy) snapshots with 409
+instead of restoring an empty KB; genuinely-empty snapshots still roll back. Snapshot
+chunk copies now preserve `ocr_used`/`ocr_confidence`. Delete paths already purged
+Mongo + Qdrant (verified, characterization-tested) — no rebuild.

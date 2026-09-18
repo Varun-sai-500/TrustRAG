@@ -19,7 +19,7 @@ from app.core.logging import get_logger
 from app.core.model_registry import get_embedding_model
 from app.db.mongodb import Collections, get_collection
 from app.db.qdrant import get_collection_name, get_qdrant_client, init_kb_collection
-from app.ingestion.chunking_strategies import ChunkingStrategy, get_chunking_strategy
+from app.ingestion.chunking_strategies import ChunkingStrategy
 from app.ingestion.sparse_vector import generate_sparse_vector
 
 logger = get_logger(__name__)
@@ -78,15 +78,10 @@ async def _index_parsed_chunks(
             user_id = doc.get("user_id")
             doc_filename = doc.get("filename", "Document")
 
-        # Use configured chunking strategy (or default sliding_window)
-        chunking_strategy = strategy or get_chunking_strategy()
-
-        # Re-chunk if needed (if original chunks were generated with different params)
-        if chunking_strategy:
-            # Regenerate chunks using the selected strategy
-            # We need page data - extract from existing chunks or fetch from source
-            # For now, use existing chunks but respect the strategy configuration
-            logger.info("Using chunking strategy", strategy=type(chunking_strategy).__name__)
+        # NOTE: chunking happens at upload time (knowledge_bases.py selects the
+        # configured strategy via get_chunking_strategy()). The `strategy`
+        # parameter is kept for backward compatibility and ignored here —
+        # this stage only embeds and indexes the chunks it receives.
 
         # Store chunks in MongoDB for future integrity audits
         import hashlib
@@ -105,6 +100,8 @@ async def _index_parsed_chunks(
                     "character_offset": c["character_offset"],
                     "zone": c.get("zone", "body"),
                     "text_hash": hashlib.sha256(c["text"].encode("utf-8")).hexdigest(),
+                    "ocr_used": bool(c.get("ocr_used", False)),
+                    "ocr_confidence": c.get("ocr_confidence"),
                 }
             )
         if mongo_chunks:
@@ -171,7 +168,7 @@ async def _index_parsed_chunks(
             # Unique deterministic ID for Qdrant point (based on doc ID and chunk index)
             point_id = hashlib_qdrant_id(doc_id_str, chunk["chunk_index"])
 
-            # Payload contains metadata + text + zone
+            # Payload contains metadata + text + zone + OCR provenance
             payload = {
                 "document_id": doc_id_str,
                 "knowledge_base_id": kb_id_str,
@@ -181,6 +178,8 @@ async def _index_parsed_chunks(
                 "character_offset": chunk["character_offset"],
                 "zone": chunk_zone,
                 "text": chunk["text"],
+                "ocr_used": bool(chunk.get("ocr_used", False)),
+                "ocr_confidence": chunk.get("ocr_confidence"),
             }
 
             points.append(

@@ -1,0 +1,8 @@
+Acme Corp Shipping Policy
+
+Effective from: 2026-01-01
+
+Orders ship within 3 to 5 business days from the warehouse in Austin.
+Shipping is free for all orders over 50 dollars.
+Express delivery is available at checkout for an additional 12 dollars.
+International shipping times vary by destination and customs processing.

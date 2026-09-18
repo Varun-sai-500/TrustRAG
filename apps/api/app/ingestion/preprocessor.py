@@ -360,15 +360,10 @@ def normalize_text(text: str) -> str:
     # "infor-\nmation" -> "information"
     normalized = HYPHEN_BREAK_RE.sub(r"\1\2", normalized)
 
-    # Normalize case once.
-    normalized = normalized.lower()
-
-    # Expand all contractions in one regex traversal instead of
-    # repeatedly rescanning the entire string with str.replace().
-    normalized = CONTRACTION_RE.sub(
-        lambda match: CONTRACTIONS[match.group(0)],
-        normalized,
-    )
+    # 4. Expand contractions
+    text_lower = normalized.lower()
+    for contraction, expansion in CONTRACTIONS.items():
+        text_lower = text_lower.replace(contraction, expansion)
 
     # 5. Collapse excessive horizontal whitespace, but PRESERVE line breaks.
     # Load-bearing: section/table heuristics (chunking strategies) and header

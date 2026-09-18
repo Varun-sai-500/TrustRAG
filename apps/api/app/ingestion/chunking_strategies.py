@@ -69,6 +69,9 @@ class SemanticChunkingStrategy(ChunkingStrategy):
             if not text.strip():
                 continue
 
+            ocr_used = bool(page_obj.get("ocr_used", False))
+            ocr_confidence = page_obj.get("ocr_confidence")
+
             # Detect potential section boundaries (headings, etc.)
             lines = text.split("\n")
             sections: list[str] = []
@@ -76,6 +79,8 @@ class SemanticChunkingStrategy(ChunkingStrategy):
 
             for line in lines:
                 # Heuristic: lines that look like headings (all caps, short, start with #)
+                # NOTE: normalize_text lowercases, so the isupper() branch only fires
+                # for digit/symbol lines; '#' markdown headings are the live signal.
                 is_heading = (
                     line.strip().startswith("#")
                     or (len(line.strip()) < 100 and line.strip().isupper())
@@ -92,38 +97,36 @@ class SemanticChunkingStrategy(ChunkingStrategy):
             if current_section:
                 sections.append("\n".join(current_section))
 
-            # Chunk each section independently, then merge adjacent chunks
-            section_chunks: list[dict[str, Any]] = []
+            # Chunk each section independently, keeping TRUE page offsets so
+            # evidence citations (character_offset) stay traceable.
+            cursor = 0
             for section in sections:
                 if not section.strip():
                     continue
+                offset = text.find(section, cursor)
+                if offset < 0:
+                    offset = cursor
                 # Use the standard chunker on each section
                 section_result = chunk_text(
-                    [{"page": page_num, "text": section}],
+                    [
+                        {
+                            "page": page_num,
+                            "text": section,
+                            "ocr_used": ocr_used,
+                            "ocr_confidence": ocr_confidence,
+                        }
+                    ],
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
                 )
-                section_chunks.extend(section_result)
-
-            # If we have multiple sections, merge first/last chunks to preserve
-            # document flow at boundaries
-            if len(section_chunks) > 1:
-                # Adjust chunk indices
-                for i, c in enumerate(section_chunks):
-                    c["chunk_index"] = chunk_index + i
+                for c in section_result:
+                    c["chunk_index"] = chunk_index
+                    chunk_index += 1
                     c["page"] = page_num
-                    c["character_offset"] = 0  # Reset for section-based chunking
+                    c["character_offset"] = offset + c["character_offset"]
                     c["zone"] = detect_chunk_zone(c["text"], page=page_num)
-                chunks.extend(section_chunks)
-                chunk_index += len(section_chunks)
-            elif section_chunks:
-                c = section_chunks[0]
-                c["chunk_index"] = chunk_index
-                c["page"] = page_num
-                c["character_offset"] = 0
-                c["zone"] = detect_chunk_zone(c["text"], page=page_num)
-                chunks.append(c)
-                chunk_index += 1
+                chunks.extend(section_result)
+                cursor = offset + len(section)
 
         return chunks
 
@@ -154,9 +157,11 @@ class ProgressiveChunkingStrategy(ChunkingStrategy):
             if not text.strip():
                 continue
 
+            ocr_used = bool(page_obj.get("ocr_used", False))
+            ocr_confidence = page_obj.get("ocr_confidence")
+
             length = len(text)
             start = 0
-            step = max(1, chunk_size - chunk_overlap)
 
             while start < length:
                 # Use progressively larger chunks near the beginning
@@ -174,15 +179,32 @@ class ProgressiveChunkingStrategy(ChunkingStrategy):
                             "chunk_index": chunk_index,
                             "character_offset": start,
                             "zone": zone,
+                            "ocr_used": ocr_used,
+                            "ocr_confidence": ocr_confidence,
                         }
                     )
                     chunk_index += 1
 
                 if end >= length:
                     break
-                start += step
+                # Step scales with the effective window: a fixed full-size step
+                # would skip text while windows are still small (silent gaps).
+                start += max(1, effective_chunk_size - chunk_overlap)
 
         return all_chunks
+
+
+def lines_of(text: str) -> list[str]:
+    """Split normalized page text into lines (newlines are preserved by normalize_text)."""
+    return text.split("\n")
+
+
+def is_table_line(line: str) -> bool:
+    """Heuristic: pipe-separated or wide multi-space lines look like table rows."""
+    stripped = line.strip()
+    return (
+        "|" in line or stripped.startswith("|") or (len(stripped) > 20 and stripped.count(" ") > 3)
+    )
 
 
 class LayoutAwareChunkingStrategy(ChunkingStrategy):
@@ -210,54 +232,53 @@ class LayoutAwareChunkingStrategy(ChunkingStrategy):
             if not text.strip():
                 continue
 
-            # Check for table markers or structured content
-            lines = text.split("\n")
-            table_rows: list[str] = []
-            content_lines: list[str] = []
+            ocr_used = bool(page_obj.get("ocr_used", False))
+            ocr_confidence = page_obj.get("ocr_confidence")
 
-            for line in lines:
-                # Detect table-like content (multiple columns, pipe-separated, etc.)
-                is_table_line = (
-                    "|" in line
-                    or line.strip().startswith("|")
-                    or (len(line.strip()) > 20 and line.strip().count(" ") > 3)
-                )
-                if is_table_line and table_rows:
-                    # Process accumulated table rows
+            # Group consecutive lines into table vs prose blocks, preserving
+            # page order. Tables are chunked as whole blocks (never split
+            # row-by-row); prose blocks go through the standard chunker.
+            blocks: list[tuple[str, list[str]]] = []
+            for line in lines_of(text):
+                if not line.strip():
+                    continue
+                kind = "table" if is_table_line(line) else "text"
+                if blocks and blocks[-1][0] == kind:
+                    blocks[-1][1].append(line)
+                else:
+                    blocks.append((kind, [line]))
+
+            for kind, block_lines in blocks:
+                if kind == "table":
                     table_chunks = self._chunk_table_content(
-                        table_rows, page_num, chunk_index, chunk_size, chunk_overlap
+                        block_lines,
+                        page_num,
+                        chunk_index,
+                        chunk_size,
+                        chunk_overlap,
+                        ocr_used,
+                        ocr_confidence,
                     )
                     chunks.extend(table_chunks)
                     chunk_index += len(table_chunks)
-                    table_rows = [line]
-                elif is_table_line:
-                    table_rows.append(line)
                 else:
-                    content_lines.append(line)
-
-            # Process remaining table rows
-            if table_rows:
-                table_chunks = self._chunk_table_content(
-                    table_rows, page_num, chunk_index, chunk_size, chunk_overlap
-                )
-                chunks.extend(table_chunks)
-                chunk_index += len(table_chunks)
-
-            # Chunk remaining content lines
-            if content_lines:
-                content_text = "\n".join(content_lines)
-                if content_text.strip():
                     section_result = chunk_text(
-                        [{"page": page_num, "text": content_text}],
+                        [
+                            {
+                                "page": page_num,
+                                "text": "\n".join(block_lines),
+                                "ocr_used": ocr_used,
+                                "ocr_confidence": ocr_confidence,
+                            }
+                        ],
                         chunk_size=chunk_size,
                         chunk_overlap=chunk_overlap,
                     )
                     for c in section_result:
                         c["chunk_index"] = chunk_index
+                        chunk_index += 1
                         c["page"] = page_num
-                        c["zone"] = detect_chunk_zone(c["text"], page=page_num)
                     chunks.extend(section_result)
-                    chunk_index += len(section_chunks) if (section_chunks := section_result) else 0
 
         return chunks
 
@@ -268,6 +289,8 @@ class LayoutAwareChunkingStrategy(ChunkingStrategy):
         chunk_index: int,
         chunk_size: int,
         chunk_overlap: int,
+        ocr_used: bool = False,
+        ocr_confidence: float | None = None,
     ) -> list[dict[str, Any]]:
         """Chunk table-related content while preserving row structure."""
         if not table_rows:
@@ -275,13 +298,20 @@ class LayoutAwareChunkingStrategy(ChunkingStrategy):
 
         combined = " ".join(table_rows)
         result = chunk_text(
-            [{"page": page_num, "text": combined}],
+            [
+                {
+                    "page": page_num,
+                    "text": combined,
+                    "ocr_used": ocr_used,
+                    "ocr_confidence": ocr_confidence,
+                }
+            ],
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
         )
 
-        for c in result:
-            c["chunk_index"] = chunk_index
+        for i, c in enumerate(result):
+            c["chunk_index"] = chunk_index + i
             c["page"] = page_num
             c["zone"] = "table"
 

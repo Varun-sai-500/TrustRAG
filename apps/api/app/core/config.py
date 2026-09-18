@@ -508,8 +508,29 @@ class ModelConfig:
         return int(self._get("retrieval", "fusion_top_k"))
 
     @property
+    def sparse_k1(self) -> float:
+        return float(self._get("retrieval", "sparse_k1", required=False) or 1.2)
+
+    @property
+    def sparse_b(self) -> float:
+        return float(self._get("retrieval", "sparse_b", required=False) or 0.75)
+
+    @property
+    def sparse_avg_len_tokens(self) -> int:
+        return int(self._get("retrieval", "sparse_avg_len_tokens", required=False) or 128)
+
+    @property
     def max_context_chunks(self) -> int:
         return int(self._get("retrieval", "max_context_chunks"))
+
+    @property
+    def router_enabled(self) -> bool:
+        return bool(self._get("retrieval", "query_router", "enabled", required=False) is not False)
+
+    @property
+    def max_fanout_sub_queries(self) -> int:
+        value = self._get("retrieval", "query_router", "max_sub_queries", required=False)
+        return int(value) if value is not None else 3
 
     # ── Ingestion ─────────────────────────────────────────────────────────────
     @property
@@ -527,6 +548,23 @@ class ModelConfig:
     @property
     def max_file_size_mb(self) -> int:
         return int(self._get("ingestion", "max_file_size_mb"))
+
+    # ── OCR fallback ─────────────────────────────────────────────────────
+    @property
+    def ocr_enabled(self) -> bool:
+        return bool(self._get("ingestion", "ocr", "enabled", required=False) is not False)
+
+    @property
+    def ocr_min_native_chars(self) -> int:
+        return int(self._get("ingestion", "ocr", "min_native_chars", required=False) or 50)
+
+    @property
+    def ocr_dpi(self) -> int:
+        return int(self._get("ingestion", "ocr", "dpi", required=False) or 300)
+
+    @property
+    def ocr_min_confidence(self) -> float:
+        return float(self._get("ingestion", "ocr", "min_confidence", required=False) or 0.5)
 
     # ── Reliability ──────────────────────────────────────────────────────────
     @property
@@ -568,6 +606,16 @@ class ModelConfig:
         value = self._get("cost_controls", "max_individual_nli_fallback", required=False)
         return int(value) if value is not None else 5
 
+    @property
+    def max_claim_retrievals(self) -> int:
+        value = self._get("cost_controls", "max_claim_retrievals", required=False)
+        return int(value) if value is not None else 3
+
+    @property
+    def claim_retrieval_top_k(self) -> int:
+        value = self._get("cost_controls", "claim_retrieval_top_k", required=False)
+        return int(value) if value is not None else 5
+
     def as_snapshot(self) -> dict[str, Any]:
         """Return a flat dict for recording with each analysis run."""
         return {
@@ -583,9 +631,16 @@ class ModelConfig:
             "reranker_enabled": self.reranker_enabled,
             "reranker_model": self.reranker_model if self.reranker_enabled else None,
             "fusion_method": self.fusion_method,
+            "fusion_top_k": self.fusion_top_k,
+            "max_fanout_sub_queries": self.max_fanout_sub_queries,
+            "ocr_enabled": self.ocr_enabled,
+            "sparse_k1": self.sparse_k1,
+            "sparse_b": self.sparse_b,
+            "sparse_avg_len_tokens": self.sparse_avg_len_tokens,
             "max_context_chunks": self.max_context_chunks,
             "abstain_below": self.abstain_below,
             "max_recovery_attempts": self.max_recovery_attempts,
+            "max_claim_retrievals": self.max_claim_retrievals,
         }
 
 

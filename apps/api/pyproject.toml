@@ -43,6 +43,7 @@ dependencies = [
 
     # ── Document processing ──────────────────────────────────────────────────
     "pymupdf>=1.24.0",            # PDF parsing (fitz) — open source
+    "rapidocr-onnxruntime>=1.4.4",  # OCR fallback for scanned pages (ONNX, torch-free)
     "chardet>=5.2.0",             # Encoding detection for text files
     "defusedxml>=0.7.1",          # Defused XML parsing against XXE attacks
 

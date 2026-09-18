@@ -5,9 +5,11 @@
 TRUSTRAG is an AI reliability workbench that implements a closed-loop reliability and self-healing engine over Retrieval-Augmented Generation (RAG):
 
 ```
-Query → Retrieve (Vector + BM25 + MCP Live Web) → Rerank (RRF) 
-      → Grounded Generation (Local llama.cpp / Ollama / Gemini / NVIDIA — per request) 
-      → Propositional Claim Decomposition → NLI Claim Verification 
+Query → Route (simple / temporal / comparison / complex, deterministic, no LLM)
+      → Retrieve (Dense + BM25-TF/IDF + MCP Live Web) → RRF fusion (fusion_top_k enforced)
+      → Rerank (cross-encoder, OFF by default, depth-capped)
+      → Grounded Generation with inline [Segment N] citations (Local llama.cpp / Ollama / Gemini / NVIDIA — per request) 
+      → Propositional Claim Decomposition → NLI Claim Verification (+ targeted NEUTRAL-only re-retrieval) 
       → Evidence Integrity & Provenance Audit → Threshold Reliability Diagnosis 
       → Adaptive Recovery Loop (LangGraph StateGraph) 
       → Re-verify → Grounded Answer / Safe Abstention
@@ -30,20 +32,30 @@ FastAPI (Python 3.12, Default Port 8000)
     │       └── local_llm.py → ChatOllamaClient, ChatLlamaCppClient (LLM-only),
     │                          CLI introspection (ollama list, llama-server --cache-list)
     ├─── app/db/           MongoDB Community / Atlas client, Qdrant client
-    ├─── app/ingestion/    Document parsing, chunking, cryptographic hashing
-    ├─── app/retrieval/    Dense (384d/768d) + Sparse BM25 + Reciprocal Rank Fusion (RRF)
-    │                      + Dynamic L2 dimension alignment & normalization
+    ├─── app/ingestion/    Document parsing (+ per-page RapidOCR-ONNX fallback for
+    │                      <50-native-char pages), selectable chunking strategies,
+    │                      newline-preserving normalization, cryptographic hashing
+    ├─── app/retrieval/    Dense (384d BGE) + sparse (client BM25-TF saturation +
+    │                      server-side Qdrant Modifier.IDF) + Reciprocal Rank Fusion
+    │                      (RRF, fusion_top_k enforced); recreate-on-mismatch for
+    │                      pre-IDF collections; cross-encoder reranker (off by
+    │                      default, top_k=20 depth cap)
     ├─── app/mcp/          Model Context Protocol (MCP) Server & Dispatcher
     │       ├── local_llm_chat    → Prompt local LLM (Ollama / llama.cpp) over MCP
     │       ├── local_llm_status  → Query local model health & discovery via MCP
     │       ├── tavily_search     → AI-curated RAG search with clean parsed snippets
     │       ├── duckduckgo_search → Zero-config, 100% free web search fallback
     │       └── hybrid_web_search → Parallel execution with URL deduplication
-    ├─── app/services/     Search Service (SSRF sanitization, private IP guards)
-    ├─── app/generation/   Grounded answer generation (Local LLMs or Cloud)
-    ├─── app/verification/ Propositional claim decomposition + NLI entailment
+    ├─── app/services/     Search Service (SSRF sanitization, private IP guards);
+    │                      KB lifecycle (snapshots, rollback with vector-less guard)
+    ├─── app/generation/   Grounded answer generation (Local LLMs or Cloud) with
+    │                      inline [Segment N] citations + invalid-ref strip post-check
+    ├─── app/verification/ Propositional claim decomposition + NLI entailment +
+    │                      targeted NEUTRAL-only claim retrieval (≤3/analysis);
+    │                      brackets-exempt scaffold-echo filter
     ├─── app/integrity/    Cryptographic SHA-256 provenance & temporal audit
-    ├─── app/agent/        LangGraph stateful self-healing workflow
+    ├─── app/agent/        LangGraph stateful self-healing workflow (deterministic
+    │                      query router + bounded fan-out inside retrieval_node)
     └─── app/evaluation/   Experiment runner & benchmark metrics
          │
 ├─── Local Engines:
@@ -53,11 +65,13 @@ FastAPI (Python 3.12, Default Port 8000)
            │       HuggingFace: BAAI/bge-small-en-v1.5 (384d SOTA embeddings)
          │
          ├─── Cloud Engines, LLM-only (Optional):
-         │       Google Gemini: gemini-3.5-flash-lite (embeddings: local BGE)
+          │       Google Gemini: gemini-2.5-flash family (embeddings: local BGE)
          │       NVIDIA NIM: meta/llama-3.3-70b-instruct (embeddings: local BGE)
          │
-         ├─── Qdrant (Vector & Payload Store)
-         │       Dense vector indexing (384d & 768d) + Payload filtering
+          ├─── Qdrant (Vector & Payload Store)
+          │       Dense vector indexing (384d only — 768d retired) + sparse-text
+          │       (Modifier.IDF) + Payload filtering; pre-IDF collections recreate
+          │       on next init (re-upload those KBs)
          │
          └─── MongoDB (Operational Data Store)
                  Users, Knowledge Bases, Analyses, Claims, Evidence, Traces
@@ -91,15 +105,20 @@ TRUSTRAG adopts the open **Model Context Protocol (MCP)** specification to decou
           │
           ▼
    [retrieval_node] ◄──────────────┐ (Adaptive Recovery Edge)
-   (Dense + Sparse + MCP Web)     │
+   (Route: simple/temporal/        │
+    comparison/complex → Dense +   │
+    Sparse + MCP Web, bounded      │
+    fan-out merged by RRF)         │
           │                        │
           ▼                        │
    [generation_node]               │
-   (Context-bound synthesis)      │
+   (Context-bound synthesis +      │
+    [Segment N] citations)         │
           │                        │
           ▼                        │
    [verification_node]             │
-   (Propositional NLI)             │
+   (Propositional NLI + targeted   │
+    NEUTRAL-only claim retrieval)  │
           │                        │
           ▼                        │
    [verdict computation]           │
@@ -125,6 +144,7 @@ TRUSTRAG adopts the open **Model Context Protocol (MCP)** specification to decou
 
 **Guardrails:**
 - Bounded strictly by `max_recovery_attempts` in `models.yaml`.
+- Router kill-switch + ceiling (`retrieval.query_router.enabled`, `max_sub_queries: 3`); claim-retrieval budget (`cost_controls.max_claim_retrievals: 3`); reranker depth floor at `fusion_top_k`; per-branch retrieval timeouts (45 s each, 60 s total).
 - State reset logic: `state["answer"] = None` and `state["claims"] = []` prevent stale abstentions from propagating when newly retrieved segments provide the missing facts.
 - Refusal gate: hedged refusals skip decomposition/NLI entirely (zero LLM calls).
 - Empty-decomposition backstop: valid-but-empty claim JSON falls back to deterministic sentence splitting (still NLI-verified downstream).

@@ -82,8 +82,10 @@ _META_CLAIM_PATTERNS = (
 # Evidence-layout references only when digit-anchored ("Segment 2 states…",
 # "Page 8 lists…", "Path A (…"), so subject-matter uses of these words
 # ("network segment", "landing page", "career path") pass through.
+# The segment pattern excludes bracketed Phase-4 citations ("[Segment 1]"),
+# which are legitimate provenance markers, not scaffold echo.
 _META_CLAIM_REGEXES = (
-    re.compile(r"\bsegments?\s+\d"),
+    re.compile(r"(?<!\[)\bsegments?\s+\d"),
     re.compile(r"\bpage\s+\d"),
     re.compile(r"\bpath\s+[a-c0-9]\b"),
 )
@@ -765,6 +767,118 @@ async def fused_decompose_verify(
         return None
 
 
+def _chunk_identity(chunk: dict[str, Any]) -> tuple[str, Any, str]:
+    """Stable dedup key for retrieved chunks across retrieval rounds."""
+    return (
+        str(chunk.get("document_id") or ""),
+        chunk.get("chunk_index"),
+        (chunk.get("text") or "")[:80],
+    )
+
+
+async def retrieve_evidence_for_claim(
+    claim_text: str,
+    kb_id_str: str,
+    seen_keys: set[tuple[str, Any, str]],
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    """Targeted hybrid retrieval for one unverified claim.
+
+    Searches the same KB with the claim text (not the original query) and
+    drops chunks already present in the analysis context. Fail-closed:
+    any outage returns [] and the claim keeps its original verdict.
+    """
+    from app.retrieval.retriever import retrieve_hybrid_chunks
+
+    try:
+        results = await retrieve_hybrid_chunks(claim_text, kb_id_str, top_k_override=top_k)
+    except Exception as exc:
+        logger.warning(
+            "Targeted claim retrieval failed; keeping original verdict",
+            error=str(exc),
+        )
+        return []
+    fresh = [c for c in results if _chunk_identity(c) not in seen_keys]
+    return fresh[:top_k]
+
+
+def _safe_object_id(value: Any) -> ObjectId | None:
+    """Convert to ObjectId, returning None for missing/malformed ids (web chunks)."""
+    if not value:
+        return None
+    try:
+        return value if isinstance(value, ObjectId) else ObjectId(str(value))
+    except Exception:
+        return None
+
+
+async def _persist_claim_evidence(
+    analysis_id: ObjectId,
+    user_id_str: str | None,
+    chunks: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], ObjectId]]:
+    """Integrity-audit, deduplicate, and persist targeted-retrieval chunks.
+
+    Returns (chunk, evidence_id) pairs for VERIFIED chunks only, so callers can
+    map fresh mini-context segment numbers onto persisted evidence IDs.
+    """
+    from app.verification.integrity import audit_evidence_integrity
+
+    audited = await audit_evidence_integrity(chunks)
+    verified = [c for c in audited if c.get("integrity_status") == "VERIFIED"]
+    if not verified:
+        return []
+
+    evidence_coll = get_collection(Collections.EVIDENCE)
+    pairs: list[tuple[dict[str, Any], ObjectId]] = []
+    missing_docs: list[dict[str, Any]] = []
+    missing_positions: list[int] = []
+    for position, chunk in enumerate(verified):
+        doc_id = _safe_object_id(chunk.get("document_id"))
+        existing = await evidence_coll.find_one(
+            {"analysis_id": analysis_id, "document_id": doc_id, "text": chunk.get("text", "")}
+        )
+        if existing is not None and existing.get("_id") is not None:
+            pairs.append((chunk, existing["_id"]))
+        else:
+            missing_positions.append(position)
+            missing_docs.append(
+                {
+                    "analysis_id": analysis_id,
+                    "user_id": ObjectId(user_id_str) if user_id_str else None,
+                    "text": chunk.get("text", ""),
+                    "document_id": doc_id,
+                    "filename": chunk.get("filename"),
+                    "url": chunk.get("url"),
+                    "retrieval_score": chunk.get("dense_score", 0.0),
+                    "fusion_score": chunk.get("rrf_score", 0.0),
+                    "rerank_score": chunk.get("rerank_score"),
+                    "method": chunk.get("method", "claim_retrieval"),
+                    "integrity_status": "VERIFIED",
+                    "effective_from": chunk.get("effective_from"),
+                    "effective_until": chunk.get("effective_until"),
+                    "created_at": datetime.now(UTC),
+                }
+            )
+
+    if missing_docs:
+        try:
+            insert_res = await evidence_coll.insert_many(missing_docs)
+            new_ids = list(insert_res.inserted_ids)
+        except TypeError:
+            new_ids = []
+            for doc in missing_docs:
+                res = await evidence_coll.insert_one(doc)
+                new_ids.append(res.inserted_id)
+        for position, new_id in zip(missing_positions, new_ids, strict=False):
+            pairs.append((verified[position], new_id))
+
+    # Preserve chunk order so mini-context indices stay aligned.
+    order = {id(chunk): i for i, chunk in enumerate(verified)}
+    pairs.sort(key=lambda pair: order[id(pair[0])])
+    return pairs
+
+
 async def execute_claim_verification(
     analysis_id_str: str,
     answer: str,
@@ -774,6 +888,7 @@ async def execute_claim_verification(
     provider: str | None = None,
     model: str | None = None,
     attempt: int = 0,
+    kb_id_str: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Decompose answer, execute NLI verifications, and save claims to MongoDB.
@@ -782,6 +897,9 @@ async def execute_claim_verification(
     Links claim records to the appropriate persisted Evidence object IDs.
     `attempt` tags the recovery round so readers can show the final round only
     (earlier rounds verified superseded answers).
+    When `kb_id_str` is provided, NEUTRAL claims (missing evidence — never
+    CONTRADICTED, which existing evidence already refutes) get one bounded
+    targeted-retrieval round each before persistence.
     """
     analysis_id = ObjectId(analysis_id_str)
     claims_coll = get_collection(Collections.CLAIMS)
@@ -899,6 +1017,67 @@ async def execute_claim_verification(
                     error=str(retry_exc),
                 )
 
+    # 2b. Targeted retrieval for NEUTRAL claims (missing evidence). Bounded by
+    # cost_controls.max_claim_retrievals; CONTRADICTED claims are excluded —
+    # existing evidence already refutes them, and re-searching for support
+    # would cherry-pick. Each targeted claim costs at most 1 retrieval + 1 NLI.
+    claim_evidence_ids: dict[int, list[ObjectId]] = {}
+    if kb_id_str:
+        neutral_positions = [
+            i
+            for i in range(1, len(claims_texts) + 1)
+            if str(results_map.get(i, {}).get("verdict", "")).upper() == "NEUTRAL"
+        ]
+        retrieval_budget = min(max(0, int(cfg.max_claim_retrievals or 0)), len(neutral_positions))
+        if retrieval_budget:
+            from app.generation.generator import format_context_with_chunk_indices as _fmt
+
+            seen_keys = {_chunk_identity(c) for c in chunks}
+            claim_top_k = int(cfg.claim_retrieval_top_k or 5)
+            for position in neutral_positions[:retrieval_budget]:
+                claim_text = claims_texts[position - 1]
+                fresh = await retrieve_evidence_for_claim(
+                    claim_text, kb_id_str, seen_keys, top_k=claim_top_k
+                )
+                if not fresh:
+                    continue
+                seen_keys.update(_chunk_identity(c) for c in fresh)
+                pairs = await _persist_claim_evidence(analysis_id, user_id_str, fresh)
+                if not pairs:
+                    continue
+                mini_chunks = [chunk for chunk, _ in pairs]
+                mini_str, mini_indices = _fmt(mini_chunks)
+                re_res = await verify_claim_nli(
+                    claim_text,
+                    mini_chunks,
+                    provider=provider,
+                    model=model,
+                    context_str=mini_str,
+                )
+                re_verdict = str(re_res.get("verdict", "")).upper()
+                if re_verdict in ("SUPPORTED", "CONTRADICTED"):
+                    mapped: list[ObjectId] = []
+                    for idx in re_res.get("supporting_segments", []):
+                        if isinstance(idx, int) and 0 < idx <= len(mini_indices):
+                            mini_pos = mini_indices[idx - 1]
+                            if 0 <= mini_pos < len(pairs):
+                                mapped.append(pairs[mini_pos][1])
+                    # NOTE: supporting_segments here are mini-context-relative and
+                    # already consumed into claim_evidence_ids above — store [] so
+                    # the persistence loop below does not re-map them against the
+                    # ORIGINAL context (that would link the wrong evidence).
+                    results_map[position] = {
+                        "verdict": re_res.get("verdict", "NEUTRAL"),
+                        "supporting_segments": [],
+                        "explanation": f"{re_res.get('explanation', '')} [targeted retrieval]",
+                    }
+                    claim_evidence_ids[position] = mapped
+                    logger.info(
+                        "Targeted claim retrieval flipped verdict",
+                        claim_position=position,
+                        verdict=re_res.get("verdict"),
+                    )
+
     # 3. Process each claim and persist to MongoDB (Batch Optimized)
     # Bound the per-claim fallback: each miss costs a full LLM call, so cap it
     # and mark the remainder NEUTRAL (conservative — never inflates trust).
@@ -954,6 +1133,23 @@ async def execute_claim_verification(
             chunk_idx = context_chunk_indices[idx - 1]
             if 0 <= chunk_idx < len(evidence_ids):
                 supporting_evidence_ids.append(evidence_ids[chunk_idx])
+
+        # Targeted-retrieval linkage from step 2b (freshly persisted evidence).
+        for extra_id in claim_evidence_ids.get(i, []):
+            if extra_id not in supporting_evidence_ids:
+                supporting_evidence_ids.append(extra_id)
+
+        # Inline provenance markers surviving in the claim text (Phase-4
+        # "[Segment N]" citations) link their segments too.
+        from app.generation.generator import extract_citations
+
+        for cited_num in extract_citations(text):
+            if 1 <= cited_num <= len(context_chunk_indices):
+                chunk_idx = context_chunk_indices[cited_num - 1]
+                if 0 <= chunk_idx < len(evidence_ids):
+                    cited_id = evidence_ids[chunk_idx]
+                    if cited_id not in supporting_evidence_ids:
+                        supporting_evidence_ids.append(cited_id)
 
         subj, pred, obj = extract_claim_triple_heuristic(text)
         claim_doc = {

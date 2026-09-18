@@ -1,5 +1,10 @@
 # TrustRAG — Implementation Status (2026-09-11)
 
+> **2026-09-16 update:** RAG quality phases 0–8 + OCR fallback implemented (see §13–§18).
+> Backend **322/322** ✅ (`pytest tests/`), ruff check + format clean ✅,
+> `uv lock --check` ✅. `models.yaml` config_version **1.7 → 1.13**.
+> Live baseline + ablations pending operator run (no local services during implementation).
+
 **Date:** 2026-09-11 → 2026-09-12  
 **Session:** Unified Senior Audit → Implementation Pass (≤2-day fixes from audit §11A) + **ONNX BGE Runtime** + **Claims verification hardening** + **Decompose+verify fusion** + **Push-readiness docs pass**  
 **Baseline Audit:** `docs/audits/2026-09-11_unified_senior_audit.md`  
@@ -246,6 +251,7 @@ Pick next from **>2-Day Items** (recommended order by impact):
 
 The codebase is **push-ready**: clean tree, 219/219 + 22/22 green, secrets clean, docs current (this pass). Push with `git push origin ui-redesign` and open the PR against `main`.
 
+---
 ### 9. Push-readiness docs pass (2026-09-12)
 (Extended same day — new/existing-user readiness.)
 
@@ -264,3 +270,169 @@ The codebase is **push-ready**: clean tree, 219/219 + 22/22 green, secrets clean
 | `.env.example` | Fixed stale `google_genai/nvidia` embedding comment → `huggingface/onnx`; added `HF_TOKENIZER_REVISION`, `FUSED_DECOMPOSE_VERIFY` |
 | `docker-compose.yml` | `web`: `npm install` → `npm ci`; `model_cache` volume comment documents the ONNX copy-in step + torch-absent rationale |
 | Deleted | `docs/AUDIT_REPORT.md` (2026-09-05, superseded) + `docs/ui-redesign-audit/` (11 archived files); zero dangling references repo-wide |
+---
+
+### 13. RAG quality phases 0–2 + OCR fallback (2026-09-16)
+
+Plan: `docs/TRUSTRAG-IMPLEMENTATION-PLAN.md` (verified against code; priority
+QUALITY > RELIABILITY > SPEED > COMPLEXITY). One phase at a time; no rewrites.
+`models.yaml` config_version 1.7 → 1.10. Backend 219 → **273 tests**, ruff clean,
+`uv lock --check` clean. No live services were up during implementation, so live
+baselines/ablations are recorded as pending operator runs (procedure + runner ready).
+
+| Phase | Change |
+|-------|--------|
+| **0 — Baseline + eval harness** | `tests/eval/metrics.py` (pure retrieval/trust/latency metrics, hand-computed unit tests); frozen `datasets/baseline_v1.jsonl` (25 queries: 12 factual + 3 temporal + 3 conflicting + 2 missing-evidence + 5 adversarial) over new `fixtures/corpus/*.txt` (6 docs incl. stale-pricing + injection graffiti); `scripts/run_baseline_eval.py` live runner (HTTP-only, respects 10/min limit, writes `docs/evaluation/results/` + optional `/experiments` record); methodology run procedure + measured-runs-only snapshot table |
+| **1 — Real sparse weighting** | `sparse_vector.py`: linear TF → BM25 TF (`zone × sat(freq)/length-norm`, k1/b/avg_len from `models.yaml`); `qdrant.py`: `sparse-text` gains `Modifier.IDF` (server-side IDF) + recreate-on-mismatch migration for pre-IDF collections (fail-open when unreadable); `retriever.py`: dead `fusion_top_k` now enforced post-RRF/post-temporal |
+| **2 — Reranker hardening** | `reranker_top_k` (dead config) wired as scoring-depth cap (default 20, floored at `fusion_top_k` so candidates are never discarded pre-score); `_rerank_sync` no longer sorts the caller's list in place; **stays `enabled: false`** — Docker runtime lacks sentence-transformers/torch by design, so enabling there is a silent no-op (documented in `models.yaml`); thresholds remain uncalibrated pending live ablation |
+| **OCR fallback (RapidOCR-ONNX)** | New `ingestion/ocr.py` (lazy singleton engine, density gate, confidence-gated output — sub-threshold text dropped, `used=True` kept for audit); `parse_pdf` routes only low-native-text pages (<50 chars) through 300dpi render → OCR, failing open to native text; `ocr_used`/`ocr_confidence` plumbed page → chunk → Mongo + Qdrant payload; `pyproject.toml` + `uv.lock` gain `rapidocr-onnxruntime==1.4.4` (reuses the shipped `onnxruntime`, no torch/system binaries, no Dockerfile change). Surya (GPL + non-commercial weights) and Docling (parser-replacing) evaluated and rejected — see session notes |
+
+**Tests added (54):** `tests/eval/` (18: metric math + dataset/fixture validation),
+`test_sparse_bm25.py` (6: saturation 1.43 vs linear 5.0, length norm, query weights),
+`test_qdrant.py` (4: create/keep/recreate/fail-open), `test_retrieval.py` +1 (fusion 50→20 exact cut),
+`test_ocr.py` (15: gate, confidence drop, fail-open, provenance — engine fully mocked),
+`test_reranker.py` (10: ordering, adaptive top-4, depth cap, no-mutate, disabled/None/exception fallbacks).
+Two self-caught issues during the work: a stripped docstring (reverted, diff-verified) and an
+un-awaited coroutine escaping a `patch` block in `test_qdrant.py` (caught by tests trying live network).
+
+**Operator pendings (all procedures documented, none fabricated):**
+1. Ingest `tests/eval/fixtures/corpus/*.txt` into a fresh KB and run
+   `python scripts/run_baseline_eval.py --email ... --password ... --kb-id <ID> --post-experiment`;
+   paste the aggregate into `docs/evaluation/methodology.md` snapshot table.
+2. Re-upload documents for any pre-IDF KB (collections recreate on next init).
+3. Pre-warm OCR models once (`~/.onnx` empty until first scanned page) so first upload doesn't stall.
+4. Enable `reranker.enabled: true` only where the `local-models` extra is installed, then run the
+   Hybrid-vs-Hybrid+Rerank ablation; calibrate early-exit/adaptive thresholds from it.
+5. Next code phase: **Phase 3 (chunking repair)** — wire strategies, fix lowercase/zone bug, tables.
+
+---
+
+### 14. Phase 3 — chunking repair (2026-09-16)
+
+Pre-existing suite was green (273/273) — nothing broken to fix; proceeded to Phase 3.
+
+**Root cause found (bigger than reported):** `normalize_text` collapsed `\s+` → `" "`,
+erasing all newlines. That single line silently disabled section splitting (semantic),
+table line detection (layout), AND the all-caps branch of header zoning — three
+features that looked wired but could never fire. Fix preserves `\n\n` paragraph breaks
+(token stream identical either way — lexer treats all whitespace as separators).
+
+| Area | Change |
+|------|--------|
+| `preprocessor.py` | Whitespace collapse keeps line breaks (`[ \t\r\f\v]+` → space, `3+\n` → `\n\n`) |
+| `chunking_strategies.py` | Semantic: true page offsets via running `find` cursor (was: all reset to 0); progressive: step scales with effective window — the fixed full-size step skipped ~80 chars per window (**silent text loss**, now covered by a gap-freedom regression test); layout: full rewrite — ordered table/prose blocks, consecutive rows chunked ONCE with sequential indices (was: re-chunked per row + scrambled order + duplicate indices); all strategies propagate `ocr_used`/`ocr_confidence` (synthetic page dicts previously dropped them) |
+| `knowledge_bases.py` | Both ingest paths (upload + URL) now chunk via `get_chunking_strategy().chunk()` — strategies selectable via `models.yaml: ingestion.chunking_strategy` (default `sliding_window` = byte-identical output to before) |
+| `pipeline.py` | Removed dead "Using chunking strategy" log block that claimed re-chunking which never happened; `strategy` param kept for compatibility |
+| `models.yaml` | `chunking_strategy: sliding_window` explicit default; version 1.10 → 1.11 |
+
+**Tests:** +14 `test_chunking_strategies.py` (normalization, wiring/equivalence, semantic
+offsets monotonic + non-zero, progressive 300-token gap-freedom, layout single-table-chunk +
+order + sequential indices, OCR passthrough ×3 strategies). **287/287 green**, ruff clean.
+Known limitation (deliberately out of scope): plain-text ALL-CAPS headings stay invisible
+to zoning — detection runs on lowercased text; fixing needs raw-text zoning, candidate for later.
+
+**Operator note:** normalization output changed (newlines preserved) → chunk text/ embeddings
+shift → **re-index KBs** after deploy (same window as the Phase-1 IDF re-index).
+
+---
+
+### 15. Phase 4 — inline citations (2026-09-16)
+
+Worked under loaded skills: `langchain-rag`, `test-driven-development` (RED→GREEN with
+the repo's own pytest/ruff commands), `surgical-patch` (narrowest layer only).
+
+**TDD-RED:** `tests/test_citations.py` written first — 8 tests failed at collection
+(missing names) plus the prompt-rule assertion. **GREEN:** minimal `generator.py`-only change:
+
+| Area | Change |
+|------|--------|
+| Prompt | `GROUNDING_SYSTEM_PROMPT` gains item 8: every factual sentence ends with `[Segment N]` (1-based, served segments only, never invented); headings exempt |
+| Post-check | New pure `extract_citations()` + `strip_invalid_citations()` — refs outside 1..N are stripped (whitespace tidied), sentences never touched (entailment stays the verifier's job); ref-free answers return byte-identical |
+| Wiring | `generate_grounded_answer` now uses `format_context_with_chunk_indices` (byte-identical prompt string) and strips hallucinated refs post-generation with a log line; ABSTAIN/empty paths unchanged |
+| Runner | `run_baseline_eval.py` scores citation existence per answer (`cited_segments` recorded); methodology footnote updated: correctness = existence until Phase 5 entailment |
+
+**Tests:** +8 (extraction incl. malformed/prose negatives, keep/strip/zero/noop matrix,
+end-to-end strip + keep-valid via mocked LLM). Existing generation tests unbroken by the
+prompt change. **295/295 green**, ruff clean. No `models.yaml` change (prompt-only phase).
+
+**Deliberately deferred to Phase 5:** populating per-claim `evidence_ids` from inline cites
+(requires decomposition-output changes — outside the narrowest layer).
+
+---
+
+### 16. Phase 5 — targeted claim retrieval (2026-09-16)
+
+Skills: `langchain-rag`, `test-driven-development` (RED→GREEN), `surgical-patch`
+(narrowest layer), `langgraph-fundamentals` (linear flow kept — retrieval happens
+inside the verification node; no new nodes/edges). TDD caught 3 GREEN bugs, including
+one REAL pre-existing conflict (below).
+
+| Area | Change |
+|------|--------|
+| `verifier.py` | New `retrieve_evidence_for_claim()` (claim-text hybrid search, drops seen chunks, fail-closed → `[]`); new `_persist_claim_evidence()` (integrity-audit → dedup vs analysis evidence → persist with `method="claim_retrieval"`, returns chunk↔id pairs); `execute_claim_verification(..., kb_id_str=None)` gains step 2b — NEUTRAL claims only, budget `min(max_claim_retrievals=3, #neutral)`, each gets ≤1 retrieval (top-5) + 1 NLI on a fresh mini-context; SUPPORTED/CONTRADICTED flips adopted with `[targeted retrieval]` explanation suffix and correctly mapped fresh evidence linkage |
+| Scope decision | CONTRADICTED claims are NEVER re-retrieved — existing evidence already refutes them; searching for support would cherry-pick |
+| Claim linkage | Persistence loop unions step-2b fresh ids + Phase-4 `[Segment N]` markers surviving in claim text (closes the Phase-4 deferral — no decomposition changes needed) |
+| `graph.py` | One line: `kb_id=state.get("kb_id")` threaded into verification; no structure change |
+| `models.yaml` | `cost_controls.max_claim_retrievals: 3`, `claim_retrieval_top_k: 5`; **deleted** dead `citation/evidence-coverage/source-integrity_weight` trio (zero readers — tuning trap); version 1.11 → 1.12 |
+
+**Real bug found by the new tests:** Phase-4 `[Segment N]` citations tripped the
+scaffold-echo meta-filter (`\bsegments?\s+\d`), silently dropping cited claims to zero
+→ honest FAIL. Fixed with a `(?<!\[)` lookbehind: bracketed citations pass, bare
+"Segment 2 states…" prose still drops (pre-existing meta tests green). Second catch:
+mini-context-relative segment numbers were briefly re-mapped against the original
+context (wrong-evidence linkage) — fixed by consuming them at flip time.
+
+**Tests:** +8 `test_claim_retrieval.py` (dedup+cap, outage → `[]`, NEUTRAL→SUPPORTED flip
+with fresh-only linkage, budget == 3 hybrid calls, CONTRADICTED never re-searched,
+no-kb skip, inline-cite union, weights-absent). **303/303 green**, ruff clean.
+Worst-case cost per analysis: +3 retrievals +3 NLI, only on failing claims, inside the
+existing verification-node timeout.
+
+---
+
+### 17. Phase 6 — deterministic query router + fan-out (2026-09-16)
+
+Skills: `langchain-rag`, `test-driven-development` (RED→GREEN), `surgical-patch`
+(narrowest layer), `langgraph-fundamentals` (linear flow kept — fan-out lives inside
+the retrieval node; no new nodes/edges; bounded concurrent branches).
+
+| Area | Change |
+|------|--------|
+| New `agent/router.py` | Pure, deterministic, zero-LLM routing: SIMPLE (today's path) / TEMPORAL (explicit year → July-1 reference_time, else caller now) / COMPARISON ("A vs B", "difference between", "compare X and Y" → 2 sub-queries) / COMPLEX (multi-"?" split, capped). Unsplittable input falls back to SIMPLE — never worse than today. `merge_fanout_results` dedups by chunk id keeping best RRF, sorts desc. `fanout_retrieve` runs sub-queries concurrently; partial outage degrades, total outage raises |
+| `graph.py` | Retrieval node routes first; SIMPLE keeps byte-identical kwargs (existing exact-kwarg test green); multi-class fans out with per-branch top_k/embedding overrides + reference_time, one `retrieval.routed` trace event; rerank → integrity → persist tail untouched |
+| `retriever.py` | **Removed** `AmbiguityDetector` + `detect_query_ambiguity` (~65 lines, zero callers — plan's adopt-or-remove verdict: remove; pre-retrieval routing supersedes it) |
+| `models.yaml` | `retrieval.query_router: {enabled: true, max_sub_queries: 3}` kill-switch + ceiling; version 1.12 → 1.13 |
+
+**TDD caught 2 issues:** the sub-query floor (10 chars) silently dropped real entities
+("Team plan" is 9 chars → whole query fell back to SIMPLE); fixed to ≥2 chars with a
+comment. Test fixture fused dicts lacked `id`, which merge correctly deduped — fixture
+fixed (real RRF output always carries `id`).
+
+**Tests:** +13 `test_router.py` (classify matrix incl. fallbacks, year→July-1, merge
+order/dedup, concurrent fan-out, partial/total outage, node-level 2-call fan-out).
+**316/316 green**, ruff clean. Simple-query cost unchanged (same single call);
+worst case 3 concurrent hybrid calls inside existing per-branch budgets.
+LLM-based sub-question decomposition deliberately NOT added — needs a live-eval
+signal that deterministic splitting is insufficient.
+
+---
+
+### 18. Phase 8 — index lifecycle (2026-09-16)
+
+Skills: `test-driven-development` (RED→GREEN), `surgical-patch` (narrowest layer).
+Verified first: KB/document delete paths already purge Mongo + Qdrant + cache
+(no orphan bug), snapshots already copy vectors — so the phase wired the missing
+surface instead of rebuilding working code.
+
+| Area | Change |
+|------|--------|
+| Routes | `POST /knowledge-bases/{id}/snapshots` → 201; `POST /knowledge-bases/{id}/rollback/{snap}` → 200 with the NEW live id (snapshot's — clients must swap; documented on the endpoint) |
+| Guard | Rollback refuses vector-less snapshots (Mongo chunks present, 0 Qdrant points — pre-vector-copy era) with 409 "re-upload instead" rather than restoring an empty KB; empty snapshots still roll back fine |
+| Fix | Snapshot chunk copies now carry `ocr_used`/`ocr_confidence` (were silently dropped, breaking the OCR provenance chain on restore) |
+| Proven | `delete_document` purges Qdrant by `document_id` filter (characterization test — was only assumed) |
+
+**Tests:** +6 `test_lifecycle.py` (both routes incl. id-swap + 409-on-foreign, empty-guard 409,
+OCR-preserving snapshot, Qdrant purge filter). **322/322 green**, ruff clean. No
+`models.yaml` change. Debugging note: `delete_kb_collection` resolves its Qdrant client
+from the qdrant module's own namespace — tests must patch `app.db.qdrant.get_qdrant_client`
+alongside the kb_service seam or they hit real Qdrant (503).

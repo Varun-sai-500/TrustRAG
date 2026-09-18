@@ -29,75 +29,9 @@ logger = get_logger(__name__)
 RETRIEVAL_BRANCH_TIMEOUT = 45.0
 
 
-# ─── Query Ambiguity Detection ──────────────────────────────────────────────
-# Detects ambiguous queries using score entropy and adjusts retrieval depth.
-
-
-class AmbiguityDetector:
-    """Detects query ambiguity based on retrieval score distribution."""
-
-    def __init__(self, entropy_threshold: float = 1.5, low_score_threshold: float = 0.5):
-        self.entropy_threshold = entropy_threshold
-        self.low_score_threshold = low_score_threshold
-
-    def detect(self, scores: list[float]) -> dict[str, Any]:
-        """
-        Detect ambiguity in retrieval scores.
-
-        Args:
-            scores: List of retrieval scores from initial fetch
-
-        Returns:
-            dict with 'is_ambiguous', 'entropy', 'avg_score', 'recommendation'
-        """
-        if not scores:
-            return {
-                "is_ambiguous": False,
-                "entropy": 0.0,
-                "avg_score": 0.0,
-                "recommendation": "none",
-            }
-
-        import math
-
-        # Calculate Shannon entropy of score distribution
-        positive_scores = [max(0, s) for s in scores]
-        min_score = min(positive_scores) if positive_scores else 0
-        adjusted_scores = [s - min_score + 0.001 for s in positive_scores]
-
-        total = sum(adjusted_scores)
-        if total == 0:
-            probabilities = [1.0 / len(adjusted_scores)] * len(adjusted_scores)
-        else:
-            probabilities = [s / total for s in adjusted_scores]
-
-        entropy = -sum(p * math.log2(p) for p in probabilities if p > 0)
-        avg_score = sum(scores) / len(scores)
-
-        is_ambiguous = entropy > self.entropy_threshold or avg_score < self.low_score_threshold
-
-        if is_ambiguous and avg_score < self.low_score_threshold:
-            recommendation = "increase_k"
-        elif is_ambiguous and entropy > self.entropy_threshold:
-            recommendation = "diversify"
-        else:
-            recommendation = "none"
-
-        return {
-            "is_ambiguous": is_ambiguous,
-            "entropy": round(entropy, 2),
-            "avg_score": round(avg_score, 3),
-            "recommendation": recommendation,
-        }
-
-
-def detect_query_ambiguity(scores: list[float]) -> dict[str, Any]:
-    """Detect ambiguity in query retrieval scores.
-
-    Convenience function for external use.
-    """
-    detector = AmbiguityDetector()
-    return detector.detect(scores)
+# NOTE (Phase 6): the AmbiguityDetector post-retrieval entropy heuristic lived
+# here with zero callers — pre-retrieval deterministic routing
+# (app/agent/router.py) supersedes it, so it was removed, not adopted.
 
 
 class QueryEmbeddingLRUCache:
@@ -247,7 +181,11 @@ async def dense_search(
 
 
 async def sparse_search(query: str, kb_id: str, top_k: int = 20) -> list[Any]:
-    """Retrieve top_k chunks using token-frequency sparse representations.
+    """Retrieve top_k chunks using BM25-style sparse representations.
+
+    Client vectors carry saturated TF weights (see app/ingestion/sparse_vector.py);
+    Qdrant multiplies query-time IDF from collection statistics
+    (sparse-text uses Modifier.IDF).
 
     Raises:
         RetrievalOutageError: When the vector store is unavailable. An empty
@@ -506,5 +444,12 @@ async def retrieve_hybrid_chunks(
 
     # Apply temporal document boundaries
     filtered = await apply_temporal_filtering(fused, reference_time)
+
+    # Bound the fused candidate set (models.yaml: retrieval.fusion_top_k).
+    # Truncation happens AFTER temporal filtering so stale drops cannot push
+    # fresh evidence out of the budget.
+    fusion_top_k = cfg.fusion_top_k
+    if fusion_top_k > 0:
+        filtered = filtered[:fusion_top_k]
 
     return filtered

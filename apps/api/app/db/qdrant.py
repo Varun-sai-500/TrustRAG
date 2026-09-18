@@ -66,13 +66,39 @@ def get_collection_name(kb_id: str) -> str:
     return f"kb_{kb_id}"
 
 
+async def _sparse_idf_enabled(client: AsyncQdrantClient, collection_name: str) -> bool | None:
+    """Check whether the collection's sparse-text index uses Modifier.IDF.
+
+    Returns None when the config cannot be read (fail-open: keep old behavior).
+    """
+    try:
+        info = await client.get_collection(collection_name)
+        params = getattr(getattr(info, "config", None), "params", None)
+        sparse_vectors = getattr(params, "sparse_vectors", None) or {}
+        sparse_params = sparse_vectors.get("sparse-text")
+        modifier = getattr(sparse_params, "modifier", None)
+        return modifier is not None and str(modifier).lower() == "idf"
+    except Exception as exc:
+        logger.warning(
+            "Could not verify sparse index config; keeping existing collection",
+            collection=collection_name,
+            error=str(exc),
+        )
+        return None
+
+
 async def init_kb_collection(kb_id: str) -> None:
     """
     Initialize a vector collection for the given knowledge base ID.
 
     Creates a collection with:
       - Dense vector parameters: Cosine distance, 384 dimensions (HuggingFace)
-      - Sparse vector parameters: BM25/keyword sparse query configuration
+      - Sparse vector parameters: BM25-style TF client vectors + server-side
+        IDF (Modifier.IDF). Qdrant derives IDF from collection statistics.
+
+    Collections created before the IDF sparse config are deleted and recreated
+    empty — their TF-only vectors are scoring-incompatible with IDF weighting.
+    Operators must re-upload the KB's documents afterwards (re-index).
     """
     client = await get_qdrant_client()
     collection_name = get_collection_name(kb_id)
@@ -82,47 +108,66 @@ async def init_kb_collection(kb_id: str) -> None:
         # Check if already exists
         exists = await client.collection_exists(collection_name)
         if exists:
-            logger.debug("Qdrant collection already exists", collection=collection_name)
-            return
-
-        logger.info(
-            "Creating Qdrant collection",
-            collection=collection_name,
-            dense_dim=cfg.embedding_dimensionality,
-        )
-
-        await client.create_collection(
-            collection_name=collection_name,
-            vectors_config=models.VectorParams(
-                size=cfg.embedding_dimensionality,
-                distance=models.Distance.COSINE,
-                on_disk=True,
-            ),
-            # Setup sparse vectors indexing (sparse query matching/BM25)
-            sparse_vectors_config={
-                "sparse-text": models.SparseVectorParams(
-                    index=models.SparseIndexParams(on_disk=True)
+            idf_enabled = await _sparse_idf_enabled(client, collection_name)
+            if idf_enabled is False:
+                logger.warning(
+                    "Recreating Qdrant collection with IDF sparse config; "
+                    "re-upload this KB's documents to re-index",
+                    collection=collection_name,
                 )
-            },
-            # Keep document payloads on disk using memory-mapped pages
-            on_disk_payload=True,
-            # Ultra-low RAM: Quantize float32 vectors to INT8 with on-disk storage
-            quantization_config=models.ScalarQuantization(
-                scalar=models.ScalarQuantizationConfig(
-                    type=models.ScalarType.INT8,
-                    quantile=0.99,
-                    always_ram=False,
-                )
-            ),
-        )
-        logger.info(
-            "Qdrant collection created with on_disk and INT8 quantization",
-            collection=collection_name,
-        )
+                await client.delete_collection(collection_name)
+            else:
+                logger.debug("Qdrant collection already exists", collection=collection_name)
+                return
+
+        await _create_kb_collection(client, collection_name, cfg)
+    except VectorStoreError:
+        raise
     except Exception as exc:
         raise VectorStoreError(
             f"Failed to initialize Qdrant collection '{collection_name}'", detail=str(exc)
         ) from exc
+
+
+async def _create_kb_collection(client: AsyncQdrantClient, collection_name: str, cfg) -> None:  # type: ignore[no-untyped-def]
+    """Create the KB collection with dense + IDF-weighted sparse vectors."""
+    logger.info(
+        "Creating Qdrant collection",
+        collection=collection_name,
+        dense_dim=cfg.embedding_dimensionality,
+    )
+
+    await client.create_collection(
+        collection_name=collection_name,
+        vectors_config=models.VectorParams(
+            size=cfg.embedding_dimensionality,
+            distance=models.Distance.COSINE,
+            on_disk=True,
+        ),
+        # Sparse leg: client sends BM25 TF-saturated values (see
+        # app/ingestion/sparse_vector.py); Qdrant multiplies query-time IDF
+        # from collection statistics (Modifier.IDF).
+        sparse_vectors_config={
+            "sparse-text": models.SparseVectorParams(
+                index=models.SparseIndexParams(on_disk=True),
+                modifier=models.Modifier.IDF,
+            )
+        },
+        # Keep document payloads on disk using memory-mapped pages
+        on_disk_payload=True,
+        # Ultra-low RAM: Quantize float32 vectors to INT8 with on-disk storage
+        quantization_config=models.ScalarQuantization(
+            scalar=models.ScalarQuantizationConfig(
+                type=models.ScalarType.INT8,
+                quantile=0.99,
+                always_ram=False,
+            )
+        ),
+    )
+    logger.info(
+        "Qdrant collection created with on_disk and INT8 quantization",
+        collection=collection_name,
+    )
 
 
 async def delete_kb_collection(kb_id: str) -> None:

@@ -97,6 +97,9 @@ def chunk_text(
                         "chunk_index": chunk_index,
                         "character_offset": start,
                         "zone": zone,
+                        # Provenance: OCR fallback flags ride page → chunk.
+                        "ocr_used": bool(page_obj.get("ocr_used", False)),
+                        "ocr_confidence": page_obj.get("ocr_confidence"),
                     }
                 )
                 chunk_index += 1

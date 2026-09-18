@@ -87,16 +87,16 @@ The portfolio differentiator is the **reliability → diagnosis → recovery loo
 
 - LangChain
 - LangGraph
-- `langchain-google-genai`
-- Google Gemini API
+- Multi-provider LLMs: llama.cpp / Ollama (local, default) + `langchain-google-genai` / NVIDIA NIM (cloud, selectable)
+- Local embeddings (BGE-small-en-v1.5 via HuggingFace or torch-free ONNX Runtime) + RapidOCR-ONNX fallback
 
 ### Retrieval
 
-- Qdrant
-- Dense retrieval
-- Sparse/BM25 retrieval
-- Hybrid fusion / RRF
-- Optional reranking
+- Qdrant (dense + `sparse-text` with server-side IDF)
+- Dense retrieval (BGE 384d, KB-pinned)
+- Sparse/BM25 retrieval (client TF-saturation + server IDF)
+- Hybrid fusion / RRF (`fusion_top_k` enforced) + deterministic query router (fan-out ≤3)
+- Optional reranking (off by default; depth-capped)
 
 ### Persistence
 
@@ -159,11 +159,10 @@ Provider choice must be documented and verified at deployment time because free-
 - multi-hop Agentic-RAG
 - workflow state/checkpointing where useful
 
-**Gemini**
+**Gemini / cloud LLMs (selectable, not default)**
 
-- LLM generation
-- configured embedding model
-- optional verification model
+- LLM generation / verification when the Gemini (or NVIDIA) provider is selected
+- Embeddings are local-only (HuggingFace/ONNX, 384d) — no cloud embedding model
 
 **Qdrant**
 
@@ -326,39 +325,46 @@ llm:
 
 embedding:
   framework: langchain
-  provider: google_genai
-  model: <configured-embedding-model>
-  output_dimensionality: 768
+  provider: huggingface            # local-only; cloud embeddings removed (D-19)
+  model: BAAI/bge-small-en-v1.5
+  output_dimensionality: 384      # versioned per KB; mismatches fail closed
   version: "1"
 
 verification:
   framework: langchain
-  provider: google_genai
+  provider: llama_cpp             # selectable per request (ollama/gemini/nvidia)
   model: <configured-verification-model>
   temperature: 0.0
-  max_output_tokens: 1024
+  max_output_tokens: 512
 
 reranker:
-  enabled: true
-  provider: configurable
-  model: configurable
-  top_k: 8
+  enabled: false                  # off by default; needs the local-models extra
+  provider: cross_encoder
+  model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  top_k: 20                       # scoring-depth cap, floored at fusion_top_k
 
 retrieval:
   dense_top_k: 20
-  sparse_top_k: 20
+  sparse_top_k: 20                # client BM25-TF + server-side Qdrant IDF
   fusion_method: rrf
-  fusion_top_k: 20
+  fusion_top_k: 20                # enforced post-RRF
   max_context_chunks: 8
+  query_router:
+    enabled: true                 # deterministic; no LLM on this path
+    max_sub_queries: 3
 
 reliability:
   minimum_evidence_coverage: 0.80
   maximum_contradiction_rate: 0.20
   abstain_below: 0.50
-  max_recovery_attempts: 2
+  max_recovery_attempts: 1
+
+cost_controls:
+  max_claim_retrievals: 3         # NEUTRAL-only targeted retrieval budget
+  claim_retrieval_top_k: 5
 
 runtime:
-  config_version: "1.0"
+  config_version: "1.13"
 ```
 
 These are engineering defaults, not calibrated truth.
@@ -480,28 +486,29 @@ Pipeline:
 ```text
 Upload
  ↓
-Parse
+Parse (+ per-page RapidOCR-ONNX fallback when native text < 50 chars;
+       sub-0.5-confidence text dropped, failures fail open to native text)
  ↓
-Normalize
+Normalize (paragraph breaks preserved) + zone
  ↓
 Clean
  ↓
 Extract metadata
  ↓
-Chunk
+Chunk (selectable strategy: sliding_window default, semantic, progressive,
+       layout_aware; tables chunked whole with zone=table)
  ↓
-Embed
+Embed (local BGE/ONNX, KB-pinned)
  ↓
-Index in Qdrant
+Index in Qdrant (dense + sparse-text with server-side IDF)
  ↓
-Persist provenance/metadata in MongoDB
+Persist provenance/metadata in MongoDB (incl. ocr_used/ocr_confidence)
 ```
 
-Supported MVP formats:
+Supported formats (8 + OCR fallback):
 
-- PDF
-- TXT
-- Markdown
+- PDF, DOCX, CSV, JSON, HTML, HTM, TXT, Markdown
+- Scanned/image PDF pages via local RapidOCR-ONNX
 
 Additional formats only when they provide clear value.
 
@@ -515,13 +522,13 @@ Implement modular retrieval:
 
 ```text
 Query
- ├── Dense
- ├── Sparse/BM25
+ ├── Route (simple / temporal / comparison / complex — deterministic, no LLM)
+ ├── Dense + Sparse/BM25 (client TF + server IDF) [×N sub-queries, merged]
  └── Metadata/Temporal filtering
        ↓
-     Fusion/RRF
+     Fusion/RRF (fusion_top_k enforced)
        ↓
-   Optional Reranking
+   Optional Reranking (off by default; depth-capped)
        ↓
    Evidence Selection
 ```
@@ -624,9 +631,13 @@ Claim states:
 ```text
 SUPPORTED
 CONTRADICTED
-UNSUPPORTED
-UNKNOWN
+NEUTRAL
 ```
+
+Answers carry inline `[Segment N]` citations (refs to unserved segments are
+stripped post-generation). NEUTRAL claims may earn one bounded targeted-retrieval
+round each (claim text as query, ≤3 per analysis); CONTRADICTED claims are never
+re-searched.
 
 ---
 
@@ -944,6 +955,8 @@ GET  /api/v1/auth/me
 
 GET  /api/v1/knowledge-bases
 POST /api/v1/knowledge-bases
+POST /api/v1/knowledge-bases/{id}/snapshots                    # → 201
+POST /api/v1/knowledge-bases/{id}/rollback/{snapshot_id}       # → 200, returns NEW live id
 
 POST /api/v1/knowledge-bases/{id}/documents
 
@@ -952,8 +965,12 @@ GET  /api/v1/analyses/{id}
 GET  /api/v1/analyses/{id}/claims
 GET  /api/v1/analyses/{id}/evidence
 GET  /api/v1/analyses/{id}/trace
+GET  /api/v1/analyses/{id}/detail
+GET  /api/v1/analyses/{id}/export
 GET  /api/v1/analyses/{id}/stream
-GET  /api/v1/analyses/{id}/graph
+
+GET  /api/v1/health                  # public, minimal (load balancers)
+GET  /api/v1/health/detailed         # authed: services, models, hardware
 ```
 
 Routes must remain thin.
@@ -969,7 +986,9 @@ Events:
 ```text
 analysis.started
 retrieval.started
+retrieval.routed
 retrieval.completed
+retrieval.self_heal_batch
 reranking.completed
 generation.started
 generation.completed
@@ -1053,7 +1072,7 @@ ModelConfiguration
 ExecutionTrace
 ```
 
-Supported/contradicted/unsupported/unknown states must be visually distinct.
+Supported/contradicted/neutral states must be visually distinct.
 
 ---
 
@@ -1091,7 +1110,10 @@ Recovery off/on
 Integrity logic off/on
 ```
 
-No fabricated results.
+No fabricated results. Live baseline runs use the frozen 25-query set
+(`apps/api/tests/eval/datasets/baseline_v1.jsonl`) via `scripts/run_baseline_eval.py`;
+results land in `docs/evaluation/results/` and the methodology snapshot table.
+Runs are PENDING operator execution — no measured rows may be invented.
 
 ---
 

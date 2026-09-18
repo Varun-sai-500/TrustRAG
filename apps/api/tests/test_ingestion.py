@@ -84,9 +84,12 @@ def test_sparse_vectorizer_generation():
     assert "values" in sparse_vec
     assert len(sparse_vec["indices"]) == len(sparse_vec["values"])
 
-    # "refund" appears twice out of 4 tokens (refund, processing, refund, window)
-    # TF weight should be 2/4 = 0.5
-    assert 0.5 in sparse_vec["values"]
+    # BM25-style TF, not linear TF: "refund" appears twice in 4 tokens.
+    # sat(2) = 2*2.2/(2+1.2) = 1.375; length norm for 4 tokens against the
+    # 128-token reference = 0.25 + 0.75*(4/128). Linear TF would give 0.5.
+    expected_refund = 1.375 / (0.25 + 0.75 * (4 / 128))
+    assert max(sparse_vec["values"]) == pytest.approx(expected_refund)
+    assert 0.5 not in sparse_vec["values"]
 
 
 @patch("app.ingestion.pipeline.init_kb_collection", AsyncMock())
