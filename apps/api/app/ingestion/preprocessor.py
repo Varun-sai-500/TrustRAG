@@ -32,6 +32,28 @@ CONTRACTIONS: dict[str, str] = {
     "'m": " am",
 }
 
+# Precompiled normalization regexes.
+NONPRINTABLE_RE = re.compile(
+    r"[\uf000-\uffff\u2022\u2023\u25cf\u25cb\u25aa\u25ab]"
+)
+
+HYPHEN_BREAK_RE = re.compile(
+    r"(\w+)-\s*\n\s*(\w+)"
+)
+
+WHITESPACE_RE = re.compile(r"\s+")
+
+# Match longest contractions first so "can't" is considered before "n't".
+CONTRACTION_RE = re.compile(
+    "|".join(
+        re.escape(key)
+        for key in sorted(CONTRACTIONS, key=len, reverse=True)
+    )
+)
+TOKEN_RE = re.compile(r"\b[a-z0-9]+(?:-[a-z0-9]+)*\b")
+
+HEADER_RE = re.compile(r"^(?:#+\s+|[A-Z0-9\s:\--]{4,50}\n)")
+
 # ─── Standard IR & Query Noise Stopwords ─────────────────────────────────────
 
 CORE_STOPWORDS: set[str] = {
@@ -308,7 +330,7 @@ def detect_chunk_zone(text: str, page: int = 1) -> str:
         return ZoneType.SUMMARY.value
 
     # 4. Header Zone: Markdown # headers or all-caps topic lines (e.g. DATA STRUCTURES)
-    if re.match(r"^(?:#+\s+|[A-Z0-9\s:\--]{4,50}\n)", text_stripped):
+    if HEADER_RE.match(text_stripped):
         return ZoneType.HEADER.value
 
     return ZoneType.BODY.value
@@ -316,35 +338,45 @@ def detect_chunk_zone(text: str, page: int = 1) -> str:
 
 # ─── Text Normalization ───────────────────────────────────────────────────────
 
-
 def normalize_text(text: str) -> str:
     """
     Perform lexical normalization on raw text:
       - NFKD Unicode normalization
-      - Stripping PDF bullet characters and non-printable symbols (e.g. \uf0d8, \u2022)
-      - Repairing hyphenated line breaks (e.g. "docu-\\nment" -> "documentation")
-      - Expanding contractions
-      - Normalizing irregular whitespace
+      - Remove PDF/private-use bullet symbols
+      - Repair hyphenated line breaks
+      - Expand contractions in one regex pass
+      - Normalize whitespace
     """
     if not text:
         return ""
 
-    # 1. Unicode NFKD normalization
+    # Unicode normalization.
     normalized = unicodedata.normalize("NFKD", text)
 
-    # 2. Remove non-printable and private-use symbols (frequent in PDF slide bullets)
-    normalized = re.sub(r"[\uf000-\uffff\u2022\u2023\u25cf\u25cb\u25aa\u25ab]", " ", normalized)
+    # Remove PDF artifacts / private-use symbols.
+    normalized = NONPRINTABLE_RE.sub(" ", normalized)
 
-    # 3. Repair line-break hyphenations: "infor-\nmation" -> "information"
-    normalized = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", normalized)
+    # Repair line-break hyphenations:
+    # "infor-\nmation" -> "information"
+    normalized = HYPHEN_BREAK_RE.sub(r"\1\2", normalized)
 
-    # 4. Expand contractions
-    text_lower = normalized.lower()
-    for contraction, expansion in CONTRACTIONS.items():
-        text_lower = text_lower.replace(contraction, expansion)
+    # Normalize case once.
+    normalized = normalized.lower()
 
-    # 5. Collapse excessive whitespace
-    cleaned = re.sub(r"\s+", " ", text_lower).strip()
+    # Expand all contractions in one regex traversal instead of
+    # repeatedly rescanning the entire string with str.replace().
+    normalized = CONTRACTION_RE.sub(
+        lambda match: CONTRACTIONS[match.group(0)],
+        normalized,
+    )
+
+    # 5. Collapse excessive horizontal whitespace, but PRESERVE line breaks.
+    # Load-bearing: section/table heuristics (chunking strategies) and header
+    # detection (detect_chunk_zone) split on "\n". Collapsing newlines to
+    # spaces silently disables all of them — and token output is identical
+    # either way since the lexer treats every whitespace run as a separator.
+    cleaned = re.sub(r"[ \t\r\f\v]+", " ", text_lower)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
 
 
@@ -670,7 +702,7 @@ def lexical_analyze(
         return []
 
     # Match words and compound terms: letters, digits, and optional interior hyphens
-    tokens = re.findall(r"\b[a-z0-9]+(?:-[a-z0-9]+)*\b", clean_text)
+    tokens = TOKEN_RE.findall(clean_text)
 
     # Use query noise filter when analyzing search queries
     stopwords = get_stopwords(include_query_noise=is_query)
@@ -678,7 +710,7 @@ def lexical_analyze(
     # Filter stopwords and very short noise (single character unless numeric/meaningful)
     filtered = [t for t in tokens if t not in stopwords and (len(t) > 1 or t.isdigit())]
 
-    stemmed = [_get_stemmer().stem(t) for t in filtered] if stem else filtered
+    stemmed = [stem_word(t) for t in filtered] if stem else filtered
 
     if not include_bigrams or len(stemmed) < 2:
         return stemmed
