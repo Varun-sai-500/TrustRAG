@@ -360,20 +360,18 @@ def normalize_text(text: str) -> str:
     # "infor-\nmation" -> "information"
     normalized = HYPHEN_BREAK_RE.sub(r"\1\2", normalized)
 
-    # 4. Expand contractions
-    text_lower = normalized.lower()
-    for contraction, expansion in CONTRACTIONS.items():
-        text_lower = text_lower.replace(contraction, expansion)
+    # Normalize case once.
+    normalized = normalized.lower()
 
-    # 5. Collapse excessive horizontal whitespace, but PRESERVE line breaks.
-    # Load-bearing: section/table heuristics (chunking strategies) and header
-    # detection (detect_chunk_zone) split on "\n". Collapsing newlines to
-    # spaces silently disables all of them — and token output is identical
-    # either way since the lexer treats every whitespace run as a separator.
-    cleaned = re.sub(r"[ \t\r\f\v]+", " ", text_lower)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned
+    # Expand all contractions in one regex traversal instead of
+    # repeatedly rescanning the entire string with str.replace().
+    normalized = CONTRACTION_RE.sub(
+        lambda match: CONTRACTIONS[match.group(0)],
+        normalized,
+    )
 
+    # Collapse whitespace once.
+    return WHITESPACE_RE.sub(" ", normalized).strip()
 
 # ─── Porter Stemmer Implementation ────────────────────────────────────────────
 
